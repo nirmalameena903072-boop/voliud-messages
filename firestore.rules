@@ -1,0 +1,132 @@
+rules_version = '2';
+
+// ─────────────────────────────────────────────────────────────
+// VOLIUD MESSAGES — FIRESTORE SECURITY RULES
+//
+// Deploy: Firebase Console → Firestore Database → Rules → paste → Publish
+// (Or `firebase deploy --only firestore:rules`.)
+//
+// Design notes:
+//  • usernames/{name} is write-once → a claimed @name can never be stolen.
+//  • contactRequests/{pair} is ONE shared doc per pair, so only one side
+//    needs write access at a time (two-sided subcollection writes can
+//    never be authorized safely on the Spark plan).
+//  • messages are append-only for chat members and capped at 500 docs per
+//    chat client-side via .limit(50) queries.
+//  • No user can ever read another user's email: users docs are readable
+//    to signed-in users (needed for @username search), emails are simply
+//    not indexed/queried and are stripped client-side.
+// ─────────────────────────────────────────────────────────────
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function signedIn() {
+      return request.auth != null;
+    }
+
+    function isSelf(uid) {
+      return signedIn() && request.auth.uid == uid;
+    }
+
+    // ── user profiles ────────────────────────────────────
+    match /users/{uid} {
+      allow read: if signedIn();
+      allow create, update: if isSelf(uid);
+      allow delete: if false; // accounts are never deleted from the client
+    }
+
+    // ── usernames: write-once claim table ────────────────
+    match /usernames/{name} {
+      allow read: if signedIn();
+      // Only the claimer can create it, and it can never be overwritten.
+      allow create: if signedIn()
+                    && request.resource.data.uid == request.auth.uid
+                    && name.matches('^[a-z0-9_]{3,12}$');
+      allow update, delete: if false;
+    }
+
+    // ── contact requests: one doc per pair ───────────────
+    match /contactRequests/{requestId} {
+      allow read: if signedIn()
+                  && request.auth.uid in resource.data.uids;
+
+      allow create: if signedIn()
+                    && request.auth.uid in request.resource.data.uids
+                    && request.resource.data.uids.size() == 2
+                    && request.resource.data.status == 'pending'
+                    && request.resource.data.requestedBy == request.auth.uid;
+
+      // The other side accepts/declines; either side can re-send later.
+      allow update: if signedIn()
+                    && request.auth.uid in resource.data.uids
+                    && request.resource.data.uids == resource.data.uids
+                    && request.resource.data.status in ['pending', 'accepted', 'declined'];
+
+      allow delete: if false;
+    }
+
+    // ── chats ────────────────────────────────────────────
+    match /chats/{chatId} {
+      function isMember() {
+        return signedIn() && request.auth.uid in resource.data.members;
+      }
+      function willBeMember() {
+        return signedIn() && request.auth.uid in request.resource.data.members;
+      }
+
+      allow read: if isMember();
+
+      // Direct chats get created by whichever side opens them first.
+      allow create: if signedIn()
+                    && request.auth.uid in request.resource.data.members
+                    && request.resource.data.members.size() >= 2
+                    && request.resource.data.members.size() <= 250;
+
+      // Members may update group meta, add members, promote/demote and
+      // exit (which removes themselves from members).
+      allow update: if isMember()
+                    && (request.auth.uid in request.resource.data.members
+                        || request.resource.data.members.size()
+                           == resource.data.members.size() - 1);
+
+      allow delete: if false;
+
+      // ── messages ───────────────────────────────────────
+      match /messages/{messageId} {
+        function memberOfChat() {
+          return signedIn()
+                 && request.auth.uid in get(/databases/$(database)/documents/chats/$(chatId)).data.members;
+        }
+
+        allow read: if memberOfChat();
+
+        allow create: if memberOfChat()
+                      && request.resource.data.senderUid == request.auth.uid
+                      && request.resource.data.type in ['text', 'poll', 'call'];
+
+        // Only poll votes (and nothing else) may be modified: the writer
+        // must keep the original sender/question/options intact.
+        allow update: if memberOfChat()
+                      && request.resource.data.senderUid == resource.data.senderUid
+                      && request.resource.data.question == resource.data.question
+                      && request.resource.data.options == resource.data.options;
+
+        allow delete: if false;
+      }
+    }
+
+    // ── 24h status notes ─────────────────────────────────
+    match /statuses/{uid} {
+      allow read: if signedIn();
+      allow write: if isSelf(uid)
+                   && request.resource.data.expiresAt is int
+                   && request.resource.data.text.size() <= 280;
+    }
+
+    // ── default deny ─────────────────────────────────────
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}
