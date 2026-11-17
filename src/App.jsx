@@ -61,6 +61,13 @@ function normalizeHandle(raw) {
   return (raw || '').trim().replace(/^@+/, '').toLowerCase().replace(/[^a-z0-9_]/g, '').slice(0, 12);
 }
 
+function formatFirestoreError(err, fallback = 'Firestore operation failed.') {
+  if (!err) return fallback;
+  const code = err.code ? `[${err.code}] ` : '';
+  const msg = err.message || (typeof err === 'string' ? err : fallback);
+  return `${code}${msg}`;
+}
+
 export default function App() {
   // Demo / Preview state (only used if Firebase placeholders are present & user enters Preview Mode)
   const [demoMode, setDemoMode] = useState(false);
@@ -124,6 +131,7 @@ export default function App() {
   const [ownerSearch, setOwnerSearch] = useState('');
   const [ownerLoading, setOwnerLoading] = useState(false);
   const [ownerError, setOwnerError] = useState('');
+  const [ownerNotice, setOwnerNotice] = useState('');
   const [announcementActiveDraft, setAnnouncementActiveDraft] = useState(false);
   const [announcementTextDraft, setAnnouncementTextDraft] = useState('');
   const [announcementSaving, setAnnouncementSaving] = useState(false);
@@ -661,8 +669,8 @@ export default function App() {
       });
 
       const errors = [];
-      if (uRes.status === 'rejected') errors.push(`Users count: ${uRes.reason?.message || 'denied'}`);
-      if (gRes.status === 'rejected') errors.push(`Groups count: ${gRes.reason?.message || 'denied'}`);
+      if (uRes.status === 'rejected') errors.push(`Users count: ${formatFirestoreError(uRes.reason)}`);
+      if (gRes.status === 'rejected') errors.push(`Groups count: ${formatFirestoreError(gRes.reason)}`);
 
       if (dirRes.status === 'fulfilled') {
         const snap = dirRes.value;
@@ -676,14 +684,14 @@ export default function App() {
         });
         setBadgeDrafts(drafts);
       } else {
-        errors.push(`Directory: ${dirRes.reason?.message || 'denied'}`);
+        errors.push(`Directory: ${formatFirestoreError(dirRes.reason)}`);
       }
 
       if (errors.length > 0) {
         setOwnerError(errors.join(' • '));
       }
     } catch (err) {
-      setOwnerError(err?.message || 'Unable to load Owner Console data.');
+      setOwnerError(formatFirestoreError(err, 'Unable to load Owner Console data.'));
     } finally {
       setOwnerLoading(false);
     }
@@ -692,6 +700,7 @@ export default function App() {
   const loadMoreDirectoryUsers = async () => {
     if (demoMode || !db || !ownerLastDoc || ownerLoading) return;
     setOwnerLoading(true);
+    setOwnerError('');
     try {
       const nextQuery = query(
         collection(db, 'users'),
@@ -712,7 +721,7 @@ export default function App() {
         return next;
       });
     } catch (err) {
-      setOwnerError(err?.message || 'Failed to load more users.');
+      setOwnerError(formatFirestoreError(err, 'Failed to load more users.'));
     } finally {
       setOwnerLoading(false);
     }
@@ -720,6 +729,8 @@ export default function App() {
 
   const openOwnerConsole = () => {
     if (!isOwnerAdmin) return;
+    setOwnerError('');
+    setOwnerNotice('');
     setAnnouncementActiveDraft(Boolean(appState.announcement?.active));
     setAnnouncementTextDraft(appState.announcement?.text || '');
     setOwnerConsoleOpen(true);
@@ -731,6 +742,7 @@ export default function App() {
     if (!isOwnerAdmin) return;
     setAnnouncementSaving(true);
     setOwnerError('');
+    setOwnerNotice('');
     const nextAnnouncement = {
       active: Boolean(announcementActiveDraft),
       text: announcementTextDraft.trim().slice(0, 180),
@@ -739,8 +751,10 @@ export default function App() {
     try {
       if (demoMode) {
         setAppState((prev) => ({ ...prev, announcement: nextAnnouncement }));
+        setOwnerNotice('Saved announcement to config/appState (preview).');
         return;
       }
+      if (!db) throw new Error('Firestore is not initialized.');
       await setDoc(
         doc(db, 'config', 'appState'),
         {
@@ -749,8 +763,9 @@ export default function App() {
         },
         { merge: true }
       );
+      setOwnerNotice('Saved Global Announcement to config/appState.');
     } catch (err) {
-      setOwnerError(err?.message || 'Could not update Global Announcement.');
+      setOwnerError(`Save announcement failed: ${formatFirestoreError(err)}`);
     } finally {
       setAnnouncementSaving(false);
     }
@@ -759,11 +774,14 @@ export default function App() {
   const handleToggleAppFeature = async (key, nextValue) => {
     if (!isOwnerAdmin) return;
     setOwnerError('');
+    setOwnerNotice('');
     try {
       if (demoMode) {
         setAppState((prev) => ({ ...prev, [key]: nextValue }));
+        setOwnerNotice(`Updated ${key} in config/appState (preview).`);
         return;
       }
+      if (!db) throw new Error('Firestore is not initialized.');
       await setDoc(
         doc(db, 'config', 'appState'),
         {
@@ -772,8 +790,9 @@ export default function App() {
         },
         { merge: true }
       );
+      setOwnerNotice(`Updated ${key} (${nextValue ? 'enabled' : 'disabled'}) in config/appState.`);
     } catch (err) {
-      setOwnerError(err?.message || 'Could not update feature toggle.');
+      setOwnerError(`Feature toggle (${key}) failed: ${formatFirestoreError(err)}`);
     }
   };
 
@@ -782,6 +801,7 @@ export default function App() {
     const cleanBadge = (rawBadge || '').trim().slice(0, 16);
     setOwnerActionUid(targetUid);
     setOwnerError('');
+    setOwnerNotice('');
     try {
       if (demoMode) {
         setOwnerDirectory((prev) =>
@@ -793,8 +813,10 @@ export default function App() {
         if (myProfile?.uid === targetUid) {
           setMyProfile((p) => (p ? { ...p, badge: cleanBadge } : p));
         }
+        setOwnerNotice(`Updated badge on users/${targetUid} (preview).`);
         return;
       }
+      if (!db) throw new Error('Firestore is not initialized.');
       await updateDoc(doc(db, 'users', targetUid), {
         badge: cleanBadge,
         updatedAt: serverTimestamp(),
@@ -802,8 +824,9 @@ export default function App() {
       setOwnerDirectory((prev) =>
         prev.map((u) => (u.uid === targetUid ? { ...u, badge: cleanBadge } : u))
       );
+      setOwnerNotice(`Updated badge on users/${targetUid}.`);
     } catch (err) {
-      setOwnerError(err?.message || 'Failed to update badge.');
+      setOwnerError(`Badge update failed (users/${targetUid}): ${formatFirestoreError(err)}`);
     } finally {
       setOwnerActionUid('');
     }
@@ -818,6 +841,7 @@ export default function App() {
     const nextBanned = !Boolean(targetUser.isBanned);
     setOwnerActionUid(targetUser.uid);
     setOwnerError('');
+    setOwnerNotice('');
     try {
       if (demoMode) {
         setOwnerDirectory((prev) =>
@@ -828,8 +852,10 @@ export default function App() {
             ? { ...prev, [targetUser.uid]: { ...prev[targetUser.uid], isBanned: nextBanned } }
             : prev
         );
+        setOwnerNotice(`Updated isBanned on users/${targetUser.uid} (preview).`);
         return;
       }
+      if (!db) throw new Error('Firestore is not initialized.');
       await updateDoc(doc(db, 'users', targetUser.uid), {
         isBanned: nextBanned,
         updatedAt: serverTimestamp(),
@@ -837,8 +863,11 @@ export default function App() {
       setOwnerDirectory((prev) =>
         prev.map((u) => (u.uid === targetUser.uid ? { ...u, isBanned: nextBanned } : u))
       );
+      setOwnerNotice(
+        `${nextBanned ? 'Banned' : 'Unbanned'} user on users/${targetUser.uid}.`
+      );
     } catch (err) {
-      setOwnerError(err?.message || 'Failed to update ban state.');
+      setOwnerError(`Ban toggle failed (users/${targetUser.uid}): ${formatFirestoreError(err)}`);
     } finally {
       setOwnerActionUid('');
     }
@@ -2002,8 +2031,35 @@ export default function App() {
               </div>
 
               {ownerError && (
-                <div className="mt-3 rounded-2xl border border-white/25 bg-[#161616] px-3.5 py-2.5 text-xs text-white/90">
-                  {ownerError}
+                <div
+                  role="alert"
+                  className="sticky top-2 z-20 mt-3 flex items-start justify-between gap-2 rounded-2xl border border-white/40 bg-[#1A1A1A] px-3.5 py-2.5 text-xs text-white shadow-spatial-card"
+                >
+                  <span className="font-mono text-[11px] leading-relaxed break-words">
+                    {ownerError}
+                  </span>
+                  <button
+                    type="button"
+                    onClick={() => setOwnerError('')}
+                    className="shrink-0 text-white/60 hover:text-white"
+                    aria-label="Clear error"
+                  >
+                    <X className="h-3.5 w-3.5" />
+                  </button>
+                </div>
+              )}
+
+              {ownerNotice && !ownerError && (
+                <div className="sticky top-2 z-20 mt-3 flex items-center justify-between gap-2 rounded-2xl border border-white/25 bg-white px-3.5 py-2 text-xs font-medium text-black shadow-spatial-white">
+                  <span className="truncate">{ownerNotice}</span>
+                  <button
+                    type="button"
+                    onClick={() => setOwnerNotice('')}
+                    className="shrink-0 text-black/60 hover:text-black"
+                    aria-label="Clear notice"
+                  >
+                    <X className="h-3.5 w-3.5" />
+                  </button>
                 </div>
               )}
 
