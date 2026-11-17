@@ -633,10 +633,11 @@ export default function App() {
     setOwnerLoading(true);
     setOwnerError('');
     try {
-      const counts = await handleFetchOwnerCounts();
-      setOwnerStats(counts);
-
       if (demoMode) {
+        setOwnerStats({
+          users: Object.keys(userProfilesMap).length,
+          groups: groups.length,
+        });
         const list = Object.values(userProfilesMap);
         setOwnerDirectory(list);
         setOwnerHasMore(false);
@@ -648,21 +649,39 @@ export default function App() {
         return;
       }
 
-      const dirQuery = query(
-        collection(db, 'users'),
-        orderBy('usernameLower'),
-        limit(25)
-      );
-      const snap = await getDocs(dirQuery);
-      const usersList = snap.docs.map((d) => ({ uid: d.id, ...d.data() }));
-      setOwnerDirectory(usersList);
-      setOwnerLastDoc(snap.docs[snap.docs.length - 1] || null);
-      setOwnerHasMore(snap.docs.length === 25);
-      const drafts = {};
-      usersList.forEach((u) => {
-        drafts[u.uid] = u.badge || '';
+      const [uRes, gRes, dirRes] = await Promise.allSettled([
+        getCountFromServer(collection(db, 'users')),
+        getCountFromServer(collection(db, 'groups')),
+        getDocs(query(collection(db, 'users'), orderBy('usernameLower'), limit(25))),
+      ]);
+
+      setOwnerStats({
+        users: uRes.status === 'fulfilled' ? uRes.value.data().count : null,
+        groups: gRes.status === 'fulfilled' ? gRes.value.data().count : null,
       });
-      setBadgeDrafts(drafts);
+
+      const errors = [];
+      if (uRes.status === 'rejected') errors.push(`Users count: ${uRes.reason?.message || 'denied'}`);
+      if (gRes.status === 'rejected') errors.push(`Groups count: ${gRes.reason?.message || 'denied'}`);
+
+      if (dirRes.status === 'fulfilled') {
+        const snap = dirRes.value;
+        const usersList = snap.docs.map((d) => ({ uid: d.id, ...d.data() }));
+        setOwnerDirectory(usersList);
+        setOwnerLastDoc(snap.docs[snap.docs.length - 1] || null);
+        setOwnerHasMore(snap.docs.length === 25);
+        const drafts = {};
+        usersList.forEach((u) => {
+          drafts[u.uid] = u.badge || '';
+        });
+        setBadgeDrafts(drafts);
+      } else {
+        errors.push(`Directory: ${dirRes.reason?.message || 'denied'}`);
+      }
+
+      if (errors.length > 0) {
+        setOwnerError(errors.join(' • '));
+      }
     } catch (err) {
       setOwnerError(err?.message || 'Unable to load Owner Console data.');
     } finally {
