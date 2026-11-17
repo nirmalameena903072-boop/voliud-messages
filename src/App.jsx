@@ -34,7 +34,7 @@ import {
   Users,
   X,
 } from 'lucide-react';
-import { auth, db, googleProvider, isFirebaseConfigured, rtdb } from './firebase';
+import { OWNER_UID, auth, db, googleProvider, isFirebaseConfigured, rtdb } from './firebase';
 import { AvatarRing3D, StatusDot, Tilt3DCard } from './components/Spatial3D';
 import { LoginScreen, OnboardingCard } from './components/AuthOnboarding';
 import { ProfileStudioDrawer } from './components/ProfileStudioDrawer';
@@ -145,10 +145,15 @@ export default function App() {
       }
     );
 
+    const matchesOwnerUid = Boolean(OWNER_UID && authUser.uid === OWNER_UID);
+    if (matchesOwnerUid) {
+      setIsOwnerAdmin(true);
+    }
+
     const adminRef = doc(db, 'admins', authUser.uid);
     getDoc(adminRef)
-      .then((snap) => setIsOwnerAdmin(snap.exists()))
-      .catch(() => setIsOwnerAdmin(false));
+      .then((snap) => setIsOwnerAdmin(matchesOwnerUid || snap.exists()))
+      .catch(() => setIsOwnerAdmin(matchesOwnerUid));
 
     return () => unsubUser();
   }, [authUser]);

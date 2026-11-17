@@ -9,7 +9,10 @@ import {
   missingFirebaseKeys,
   isFirebaseConfigured,
   DEMO_MODE,
+  resolvedOwnerUid,
 } from './firebase-config.js';
+
+export const OWNER_UID = resolvedOwnerUid;
 
 export {
   firebaseConfig,
@@ -17,6 +20,7 @@ export {
   missingFirebaseKeys,
   isFirebaseConfigured,
   DEMO_MODE,
+  resolvedOwnerUid,
 };
 
 let app = null;

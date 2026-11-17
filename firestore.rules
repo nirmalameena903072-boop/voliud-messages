@@ -6,7 +6,10 @@ service cloud.firestore {
     }
 
     function isOwnerAdmin() {
-      return isSignedIn() && exists(/databases/$(database)/documents/admins/$(request.auth.uid));
+      return isSignedIn() && (
+        request.auth.uid == 'Y63ZCswFUsZbdBtbi1O4RLRV3ii2' ||
+        exists(/databases/$(database)/documents/admins/$(request.auth.uid))
+      );
     }
 
     function isAcceptedContact(chatId) {

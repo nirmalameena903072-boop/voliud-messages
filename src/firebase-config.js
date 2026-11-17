@@ -25,3 +25,4 @@ export const missingFirebaseKeys = REQUIRED_FIREBASE_KEYS.filter(({ key }) => {
 
 export const isFirebaseConfigured = missingFirebaseKeys.length === 0;
 export const DEMO_MODE = !isFirebaseConfigured;
+export const resolvedOwnerUid = 'Y63ZCswFUsZbdBtbi1O4RLRV3ii2';
