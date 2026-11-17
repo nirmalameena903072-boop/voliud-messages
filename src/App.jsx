@@ -146,9 +146,13 @@ export default function App() {
       (snap) => {
         if (snap.exists()) {
           const data = snap.data();
+          const isActive = Boolean(data.announcement?.active);
+          if (!isActive) {
+            setDismissedBannerText('');
+          }
           setAppState({
             announcement: {
-              active: Boolean(data.announcement?.active),
+              active: isActive,
               text: data.announcement?.text || '',
             },
             allowNewSignups: data.allowNewSignups !== false,
