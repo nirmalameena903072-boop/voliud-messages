@@ -13,6 +13,7 @@ import {
   doc,
   getCountFromServer,
   getDoc,
+  getDocs,
   limit,
   onSnapshot,
   orderBy,
@@ -20,18 +21,27 @@ import {
   runTransaction,
   serverTimestamp,
   setDoc,
+  startAfter,
   updateDoc,
   where,
 } from 'firebase/firestore';
 import { onDisconnect, onValue, ref as rtdbRef, remove as rtdbRemove, set as rtdbSet } from 'firebase/database';
 import {
+  Ban,
   Bell,
+  Check,
   Home,
+  Megaphone,
   MessageSquare,
   Plus,
+  RefreshCw,
   Search,
+  Shield,
   Sparkles,
+  Tag,
+  UserPlus,
   Users,
+  Video,
   X,
 } from 'lucide-react';
 import { OWNER_UID, auth, db, googleProvider, isFirebaseConfigured, rtdb } from './firebase';
@@ -97,9 +107,60 @@ export default function App() {
   const [busyActionId, setBusyActionId] = useState('');
   const [activeTab, setActiveTab] = useState('all'); // 'all' | 'direct' | 'groups'
 
+  // Global App Config (config/appState) & Dismissible Banner
+  const [appState, setAppState] = useState({
+    announcement: { active: false, text: '' },
+    allowNewSignups: true,
+    allowVideoCalls: true,
+  });
+  const [dismissedBannerText, setDismissedBannerText] = useState('');
+
+  // Owner / Admin Console (Spark-plan friendly on-demand queries)
+  const [ownerConsoleOpen, setOwnerConsoleOpen] = useState(false);
+  const [ownerStats, setOwnerStats] = useState({ users: null, groups: null });
+  const [ownerDirectory, setOwnerDirectory] = useState([]);
+  const [ownerLastDoc, setOwnerLastDoc] = useState(null);
+  const [ownerHasMore, setOwnerHasMore] = useState(false);
+  const [ownerSearch, setOwnerSearch] = useState('');
+  const [ownerLoading, setOwnerLoading] = useState(false);
+  const [ownerError, setOwnerError] = useState('');
+  const [announcementActiveDraft, setAnnouncementActiveDraft] = useState(false);
+  const [announcementTextDraft, setAnnouncementTextDraft] = useState('');
+  const [announcementSaving, setAnnouncementSaving] = useState(false);
+  const [badgeDrafts, setBadgeDrafts] = useState({});
+  const [ownerActionUid, setOwnerActionUid] = useState('');
+
   // Demo sandbox data store
   const [demoMessagesByChat, setDemoMessagesByChat] = useState({});
   const typingTimerRef = useRef(null);
+
+  // ---------------------------------------------------------------------------
+  // 0. Global App State Listener (config/appState - single doc, Spark friendly)
+  // ---------------------------------------------------------------------------
+  useEffect(() => {
+    if (!isFirebaseConfigured || !db) return;
+
+    const appStateRef = doc(db, 'config', 'appState');
+    const unsub = onSnapshot(
+      appStateRef,
+      (snap) => {
+        if (snap.exists()) {
+          const data = snap.data();
+          setAppState({
+            announcement: {
+              active: Boolean(data.announcement?.active),
+              text: data.announcement?.text || '',
+            },
+            allowNewSignups: data.allowNewSignups !== false,
+            allowVideoCalls: data.allowVideoCalls !== false,
+          });
+        }
+      },
+      () => {}
+    );
+
+    return () => unsub();
+  }, []);
 
   // ---------------------------------------------------------------------------
   // 1. Firebase Auth Listener & Redirect Handling
@@ -444,6 +505,9 @@ export default function App() {
     setAuthLoading(true);
     setOnboardError('');
     try {
+      if (!appState.allowNewSignups) {
+        throw new Error('New sign-ups are currently disabled by the administrator.');
+      }
       if (demoMode) {
         const profile = {
           uid: 'demo_me',
@@ -453,6 +517,8 @@ export default function App() {
           status: 'Online',
           statusNote: '',
           statusExpiresAt: null,
+          isBanned: false,
+          badge: '',
         };
         setMyProfile(profile);
         setUserProfilesMap((prev) => ({ ...prev, demo_me: profile }));
@@ -492,6 +558,8 @@ export default function App() {
           status: 'Online',
           statusNote: '',
           statusExpiresAt: null,
+          isBanned: false,
+          badge: '',
           createdAt: nowTs,
           updatedAt: nowTs,
         });
@@ -555,6 +623,202 @@ export default function App() {
       users: uSnap.data().count,
       groups: gSnap.data().count,
     };
+  };
+
+  const loadOwnerConsoleData = async () => {
+    setOwnerLoading(true);
+    setOwnerError('');
+    try {
+      const counts = await handleFetchOwnerCounts();
+      setOwnerStats(counts);
+
+      if (demoMode) {
+        const list = Object.values(userProfilesMap);
+        setOwnerDirectory(list);
+        setOwnerHasMore(false);
+        const drafts = {};
+        list.forEach((u) => {
+          drafts[u.uid] = u.badge || '';
+        });
+        setBadgeDrafts(drafts);
+        return;
+      }
+
+      const dirQuery = query(
+        collection(db, 'users'),
+        orderBy('usernameLower'),
+        limit(25)
+      );
+      const snap = await getDocs(dirQuery);
+      const usersList = snap.docs.map((d) => ({ uid: d.id, ...d.data() }));
+      setOwnerDirectory(usersList);
+      setOwnerLastDoc(snap.docs[snap.docs.length - 1] || null);
+      setOwnerHasMore(snap.docs.length === 25);
+      const drafts = {};
+      usersList.forEach((u) => {
+        drafts[u.uid] = u.badge || '';
+      });
+      setBadgeDrafts(drafts);
+    } catch (err) {
+      setOwnerError(err?.message || 'Unable to load Owner Console data.');
+    } finally {
+      setOwnerLoading(false);
+    }
+  };
+
+  const loadMoreDirectoryUsers = async () => {
+    if (demoMode || !db || !ownerLastDoc || ownerLoading) return;
+    setOwnerLoading(true);
+    try {
+      const nextQuery = query(
+        collection(db, 'users'),
+        orderBy('usernameLower'),
+        startAfter(ownerLastDoc),
+        limit(25)
+      );
+      const snap = await getDocs(nextQuery);
+      const more = snap.docs.map((d) => ({ uid: d.id, ...d.data() }));
+      setOwnerDirectory((prev) => [...prev, ...more]);
+      setOwnerLastDoc(snap.docs[snap.docs.length - 1] || null);
+      setOwnerHasMore(snap.docs.length === 25);
+      setBadgeDrafts((prev) => {
+        const next = { ...prev };
+        more.forEach((u) => {
+          next[u.uid] = u.badge || '';
+        });
+        return next;
+      });
+    } catch (err) {
+      setOwnerError(err?.message || 'Failed to load more users.');
+    } finally {
+      setOwnerLoading(false);
+    }
+  };
+
+  const openOwnerConsole = () => {
+    if (!isOwnerAdmin) return;
+    setAnnouncementActiveDraft(Boolean(appState.announcement?.active));
+    setAnnouncementTextDraft(appState.announcement?.text || '');
+    setOwnerConsoleOpen(true);
+    loadOwnerConsoleData();
+  };
+
+  const handleSaveAnnouncement = async (e) => {
+    e.preventDefault();
+    if (!isOwnerAdmin) return;
+    setAnnouncementSaving(true);
+    setOwnerError('');
+    const nextAnnouncement = {
+      active: Boolean(announcementActiveDraft),
+      text: announcementTextDraft.trim().slice(0, 180),
+      updatedBy: myProfile?.uid || authUser?.uid || '',
+    };
+    try {
+      if (demoMode) {
+        setAppState((prev) => ({ ...prev, announcement: nextAnnouncement }));
+        return;
+      }
+      await setDoc(
+        doc(db, 'config', 'appState'),
+        {
+          announcement: { ...nextAnnouncement, updatedAt: serverTimestamp() },
+          updatedAt: serverTimestamp(),
+        },
+        { merge: true }
+      );
+    } catch (err) {
+      setOwnerError(err?.message || 'Could not update Global Announcement.');
+    } finally {
+      setAnnouncementSaving(false);
+    }
+  };
+
+  const handleToggleAppFeature = async (key, nextValue) => {
+    if (!isOwnerAdmin) return;
+    setOwnerError('');
+    try {
+      if (demoMode) {
+        setAppState((prev) => ({ ...prev, [key]: nextValue }));
+        return;
+      }
+      await setDoc(
+        doc(db, 'config', 'appState'),
+        {
+          [key]: nextValue,
+          updatedAt: serverTimestamp(),
+        },
+        { merge: true }
+      );
+    } catch (err) {
+      setOwnerError(err?.message || 'Could not update feature toggle.');
+    }
+  };
+
+  const handleAssignBadge = async (targetUid, rawBadge) => {
+    if (!isOwnerAdmin || !targetUid) return;
+    const cleanBadge = (rawBadge || '').trim().slice(0, 16);
+    setOwnerActionUid(targetUid);
+    setOwnerError('');
+    try {
+      if (demoMode) {
+        setOwnerDirectory((prev) =>
+          prev.map((u) => (u.uid === targetUid ? { ...u, badge: cleanBadge } : u))
+        );
+        setUserProfilesMap((prev) =>
+          prev[targetUid] ? { ...prev, [targetUid]: { ...prev[targetUid], badge: cleanBadge } } : prev
+        );
+        if (myProfile?.uid === targetUid) {
+          setMyProfile((p) => (p ? { ...p, badge: cleanBadge } : p));
+        }
+        return;
+      }
+      await updateDoc(doc(db, 'users', targetUid), {
+        badge: cleanBadge,
+        updatedAt: serverTimestamp(),
+      });
+      setOwnerDirectory((prev) =>
+        prev.map((u) => (u.uid === targetUid ? { ...u, badge: cleanBadge } : u))
+      );
+    } catch (err) {
+      setOwnerError(err?.message || 'Failed to update badge.');
+    } finally {
+      setOwnerActionUid('');
+    }
+  };
+
+  const handleToggleBan = async (targetUser) => {
+    if (!isOwnerAdmin || !targetUser?.uid) return;
+    if (targetUser.uid === myProfile?.uid) {
+      setOwnerError('You cannot ban your own active owner account.');
+      return;
+    }
+    const nextBanned = !Boolean(targetUser.isBanned);
+    setOwnerActionUid(targetUser.uid);
+    setOwnerError('');
+    try {
+      if (demoMode) {
+        setOwnerDirectory((prev) =>
+          prev.map((u) => (u.uid === targetUser.uid ? { ...u, isBanned: nextBanned } : u))
+        );
+        setUserProfilesMap((prev) =>
+          prev[targetUser.uid]
+            ? { ...prev, [targetUser.uid]: { ...prev[targetUser.uid], isBanned: nextBanned } }
+            : prev
+        );
+        return;
+      }
+      await updateDoc(doc(db, 'users', targetUser.uid), {
+        isBanned: nextBanned,
+        updatedAt: serverTimestamp(),
+      });
+      setOwnerDirectory((prev) =>
+        prev.map((u) => (u.uid === targetUser.uid ? { ...u, isBanned: nextBanned } : u))
+      );
+    } catch (err) {
+      setOwnerError(err?.message || 'Failed to update ban state.');
+    } finally {
+      setOwnerActionUid('');
+    }
   };
 
   // ---------------------------------------------------------------------------
@@ -718,7 +982,7 @@ export default function App() {
   // Handlers: Messaging, Typing, Calls, Polls, Groups
   // ---------------------------------------------------------------------------
   const sendMessagePayload = async (payload) => {
-    if (!activeChat || !myProfile) return;
+    if (!activeChat || !myProfile || myProfile.isBanned) return;
 
     const baseMsg = {
       senderUid: myProfile.uid,
@@ -784,6 +1048,7 @@ export default function App() {
   };
 
   const handleSendCallInvite = async () => {
+    if (!appState.allowVideoCalls || myProfile?.isBanned) return;
     const now = Date.now();
     await sendMessagePayload({
       type: 'call_invite',
@@ -1246,7 +1511,7 @@ export default function App() {
   const renderContent = () => {
     if (!authReady || profileLoading) {
       return (
-        <div className="flex h-[100dvh] flex-col items-center justify-center gap-4 bg-black">
+        <div className="flex h-full flex-col items-center justify-center gap-4 bg-black">
           <div className="h-10 w-10 animate-spin rounded-full border-2 border-white/15 border-t-white" />
           <span className="font-mono text-xs uppercase tracking-[0.22em] text-white/45">
             Voliud Initializing
@@ -1270,6 +1535,7 @@ export default function App() {
       return (
         <OnboardingCard
           initialNickname={authUser?.displayName || ''}
+          allowNewSignups={appState.allowNewSignups}
           onComplete={handleCompleteOnboarding}
           loading={authLoading}
           error={onboardError}
@@ -1287,6 +1553,7 @@ export default function App() {
           myProfile={myProfile}
           messages={messages}
           typingUsers={typingUsers}
+          allowVideoCalls={appState.allowVideoCalls}
           onBack={() => setActiveChat(null)}
           onOpenGroupInfo={() => setGroupInfoOpen(true)}
           onSendMessage={handleSendMessage}
@@ -1305,7 +1572,7 @@ export default function App() {
     const filteredGroups = groups;
 
     return (
-      <div className="flex h-[100dvh] w-full flex-col bg-black">
+      <div className="flex h-full w-full flex-col bg-black">
         {/* Top Spatial Header */}
         <header className="shrink-0 border-b border-white/14 bg-[#080808]/95 px-4 pt-4 pb-3 backdrop-blur-md">
           <div className="flex items-center justify-between gap-3">
@@ -1320,6 +1587,11 @@ export default function App() {
                   <h1 className="truncate text-base font-semibold tracking-tight text-white">
                     Voliud
                   </h1>
+                  {myProfile.badge && (
+                    <span className="rounded-full border border-white/25 bg-white/10 px-2 py-0.5 font-mono text-[9px] font-semibold uppercase tracking-wider text-white">
+                      {myProfile.badge}
+                    </span>
+                  )}
                   {demoMode && (
                     <span className="rounded-full border border-white/20 bg-white/10 px-2 py-0.5 font-mono text-[9px] uppercase tracking-wider text-white/75">
                       Preview
@@ -1540,10 +1812,15 @@ export default function App() {
                         animated={false}
                       />
                       <div className="min-w-0">
-                        <div className="flex items-center gap-2">
+                        <div className="flex items-center gap-1.5">
                           <span className="truncate text-sm font-semibold text-white">
                             {contact.nickname || `@${contact.usernameLower}`}
                           </span>
+                          {contact.badge && (
+                            <span className="shrink-0 rounded-full border border-white/25 bg-white/10 px-1.5 py-0.5 font-mono text-[8.5px] font-semibold uppercase tracking-wider text-white">
+                              {contact.badge}
+                            </span>
+                          )}
                           <span className="truncate font-mono text-[11px] text-white/40">
                             @{contact.usernameLower}
                           </span>
@@ -1592,10 +1869,47 @@ export default function App() {
     );
   };
 
+  const showGlobalBanner =
+    Boolean(appState.announcement?.active) &&
+    Boolean(appState.announcement?.text?.trim()) &&
+    dismissedBannerText !== appState.announcement.text.trim();
+
+  const filteredDirectory = ownerDirectory.filter((u) => {
+    const q = ownerSearch.trim().toLowerCase();
+    if (!q) return true;
+    return (
+      (u.usernameLower || '').toLowerCase().includes(q) ||
+      (u.nickname || '').toLowerCase().includes(q) ||
+      (u.uid || '').toLowerCase().includes(q)
+    );
+  });
+
   return (
     <div className="min-h-[100dvh] w-full bg-black flex justify-center">
-      <div className="relative h-[100dvh] w-full max-w-[480px] overflow-hidden bg-black sm:border-x sm:border-white/14 sm:shadow-[0_0_90px_rgba(255,255,255,0.05)]">
-        {renderContent()}
+      <div className="relative flex h-[100dvh] w-full max-w-[480px] flex-col overflow-hidden bg-black sm:border-x sm:border-white/14 sm:shadow-[0_0_90px_rgba(255,255,255,0.05)]">
+        {/* Live Dismissible Global Announcement Banner (config/appState) */}
+        {showGlobalBanner && (
+          <div className="shrink-0 flex items-center justify-between gap-2.5 border-b border-white/25 bg-white px-3.5 py-2 text-black shadow-spatial-white z-30">
+            <div className="flex items-center gap-2 min-w-0">
+              <Megaphone className="h-3.5 w-3.5 shrink-0 text-black" />
+              <p className="text-xs font-semibold leading-snug break-words">
+                {appState.announcement.text.trim()}
+              </p>
+            </div>
+            <button
+              type="button"
+              onClick={() => setDismissedBannerText(appState.announcement.text.trim())}
+              className="flex h-6 w-6 shrink-0 items-center justify-center rounded-full border border-black/15 bg-black/5 text-black hover:bg-black/15 transition"
+              aria-label="Dismiss announcement"
+            >
+              <X className="h-3.5 w-3.5" />
+            </button>
+          </div>
+        )}
+
+        <div className="min-h-0 flex-1 overflow-hidden">
+          {renderContent()}
+        </div>
 
         {/* ?add=username Auto-Popup 3D Profile Preview Card */}
         {inviteModalUser && myProfile && (
@@ -1618,9 +1932,347 @@ export default function App() {
           profile={myProfile}
           isOwnerAdmin={isOwnerAdmin}
           onSaveProfile={handleSaveProfile}
-          onFetchOwnerCounts={handleFetchOwnerCounts}
+          onOpenOwnerConsole={openOwnerConsole}
           onSignOut={handleSignOut}
         />
+
+        {/* Owner / Admin Console (Spark-plan friendly) */}
+        {ownerConsoleOpen && isOwnerAdmin && (
+          <div
+            className="fixed inset-0 z-50 flex items-end justify-center bg-black/85 backdrop-blur-md"
+            onClick={() => setOwnerConsoleOpen(false)}
+          >
+            <div
+              onClick={(e) => e.stopPropagation()}
+              className="scene-3d animate-drawer-3d w-full max-w-[480px] max-h-[92dvh] overflow-y-auto mono-scroll rounded-t-[30px] border-t border-x border-white/20 bg-[#0D0D0D] px-5 pt-4 pb-8 shadow-spatial-card"
+            >
+              <div className="mx-auto mb-3 h-1 w-10 rounded-full bg-white/25" />
+              <div className="flex items-center justify-between gap-2">
+                <div>
+                  <div className="flex items-center gap-1.5 text-[10px] font-semibold uppercase tracking-[0.2em] text-white/50">
+                    <Shield className="h-3.5 w-3.5 text-white" />
+                    <span>UID-Locked Telemetry</span>
+                  </div>
+                  <h2 className="mt-0.5 text-lg font-semibold text-white">
+                    Owner / Admin Console
+                  </h2>
+                </div>
+                <div className="flex items-center gap-2">
+                  <button
+                    type="button"
+                    onClick={loadOwnerConsoleData}
+                    disabled={ownerLoading}
+                    className="flex h-9 items-center gap-1.5 rounded-full border border-white/18 bg-[#161616] px-3 text-xs text-white/85 hover:border-white/40 transition disabled:opacity-50"
+                  >
+                    <RefreshCw className={`h-3.5 w-3.5 ${ownerLoading ? 'animate-spin' : ''}`} />
+                    <span>Refresh</span>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setOwnerConsoleOpen(false)}
+                    className="flex h-9 w-9 items-center justify-center rounded-full border border-white/15 bg-[#161616] text-white/75 hover:text-white transition"
+                    aria-label="Close Owner Console"
+                  >
+                    <X className="h-4 w-4" />
+                  </button>
+                </div>
+              </div>
+
+              {ownerError && (
+                <div className="mt-3 rounded-2xl border border-white/25 bg-[#161616] px-3.5 py-2.5 text-xs text-white/90">
+                  {ownerError}
+                </div>
+              )}
+
+              {/* 4. App Stats via getCountFromServer() */}
+              <div className="mt-4 grid grid-cols-2 gap-3">
+                <Tilt3DCard
+                  intensity={5}
+                  className="rounded-2xl border border-white/16 bg-black p-3.5 shadow-spatial-card"
+                >
+                  <div className="flex items-center gap-1.5 text-[11px] text-white/55">
+                    <Users className="h-3.5 w-3.5" />
+                    <span>Total Users</span>
+                  </div>
+                  <div className="mt-1.5 font-mono text-2xl font-bold text-white">
+                    {ownerLoading && ownerStats.users === null ? '...' : ownerStats.users ?? '—'}
+                  </div>
+                  <div className="mt-0.5 font-mono text-[9.5px] text-white/35">
+                    getCountFromServer()
+                  </div>
+                </Tilt3DCard>
+
+                <Tilt3DCard
+                  intensity={5}
+                  className="rounded-2xl border border-white/16 bg-black p-3.5 shadow-spatial-card"
+                >
+                  <div className="flex items-center gap-1.5 text-[11px] text-white/55">
+                    <MessageSquare className="h-3.5 w-3.5" />
+                    <span>Total Groups</span>
+                  </div>
+                  <div className="mt-1.5 font-mono text-2xl font-bold text-white">
+                    {ownerLoading && ownerStats.groups === null ? '...' : ownerStats.groups ?? '—'}
+                  </div>
+                  <div className="mt-0.5 font-mono text-[9.5px] text-white/35">
+                    getCountFromServer()
+                  </div>
+                </Tilt3DCard>
+              </div>
+
+              {/* 1. Global Announcement Banner Editor (config/appState) */}
+              <form
+                onSubmit={handleSaveAnnouncement}
+                className="mt-5 rounded-2xl border border-white/16 bg-black p-4 space-y-3"
+              >
+                <div className="flex items-center justify-between">
+                  <div className="flex items-center gap-2">
+                    <Megaphone className="h-4 w-4 text-white" />
+                    <span className="text-xs font-semibold uppercase tracking-[0.15em] text-white">
+                      Global Announcement
+                    </span>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => setAnnouncementActiveDraft((v) => !v)}
+                    className={`flex h-6 w-11 items-center rounded-full p-0.5 transition ${
+                      announcementActiveDraft ? 'bg-white justify-end' : 'bg-white/20 justify-start'
+                    }`}
+                    aria-label="Toggle Global Announcement Active"
+                  >
+                    <span
+                      className={`h-5 w-5 rounded-full transition ${
+                        announcementActiveDraft ? 'bg-black' : 'bg-white/80'
+                      }`}
+                    />
+                  </button>
+                </div>
+
+                <input
+                  type="text"
+                  value={announcementTextDraft}
+                  onChange={(e) => setAnnouncementTextDraft(e.target.value.slice(0, 180))}
+                  placeholder="Broadcast a live banner to all users..."
+                  className="w-full rounded-xl border border-white/16 bg-[#121212] px-3 py-2 text-xs text-white placeholder:text-white/30 focus:border-white focus:outline-none"
+                />
+
+                <div className="flex items-center justify-between gap-2">
+                  <span className="font-mono text-[10px] text-white/40">
+                    config/appState • {announcementActiveDraft ? 'Active' : 'Hidden'}
+                  </span>
+                  <button
+                    type="submit"
+                    disabled={announcementSaving}
+                    className="rounded-xl bg-white px-3.5 py-1.5 text-xs font-semibold text-black shadow-spatial-white transition active:scale-95 disabled:opacity-50"
+                  >
+                    {announcementSaving ? 'Saving...' : 'Publish Banner'}
+                  </button>
+                </div>
+              </form>
+
+              {/* 2. Live Feature Toggles (config/appState) */}
+              <div className="mt-4 rounded-2xl border border-white/16 bg-black p-4 space-y-2.5">
+                <div className="text-[10px] font-semibold uppercase tracking-[0.18em] text-white/45">
+                  Live Feature Toggles (config/appState)
+                </div>
+
+                <button
+                  type="button"
+                  onClick={() => handleToggleAppFeature('allowNewSignups', !appState.allowNewSignups)}
+                  className="flex w-full items-center justify-between rounded-xl border border-white/14 bg-[#121212] px-3.5 py-2.5 text-left"
+                >
+                  <div className="flex items-center gap-2.5 pr-3">
+                    <UserPlus className="h-4 w-4 text-white/80 shrink-0" />
+                    <div>
+                      <div className="text-xs font-semibold text-white">New Sign-ups</div>
+                      <div className="text-[10.5px] text-white/45">
+                        Allow new users to claim @username handles
+                      </div>
+                    </div>
+                  </div>
+                  <div
+                    className={`flex h-6 w-11 shrink-0 items-center rounded-full p-0.5 transition ${
+                      appState.allowNewSignups ? 'bg-white justify-end' : 'bg-white/20 justify-start'
+                    }`}
+                  >
+                    <span
+                      className={`h-5 w-5 rounded-full ${
+                        appState.allowNewSignups ? 'bg-black' : 'bg-white/80'
+                      }`}
+                    />
+                  </div>
+                </button>
+
+                <button
+                  type="button"
+                  onClick={() => handleToggleAppFeature('allowVideoCalls', !appState.allowVideoCalls)}
+                  className="flex w-full items-center justify-between rounded-xl border border-white/14 bg-[#121212] px-3.5 py-2.5 text-left"
+                >
+                  <div className="flex items-center gap-2.5 pr-3">
+                    <Video className="h-4 w-4 text-white/80 shrink-0" />
+                    <div>
+                      <div className="text-xs font-semibold text-white">45s Video Calls</div>
+                      <div className="text-[10.5px] text-white/45">
+                        Enable Jitsi 45-second expiring call invites
+                      </div>
+                    </div>
+                  </div>
+                  <div
+                    className={`flex h-6 w-11 shrink-0 items-center rounded-full p-0.5 transition ${
+                      appState.allowVideoCalls ? 'bg-white justify-end' : 'bg-white/20 justify-start'
+                    }`}
+                  >
+                    <span
+                      className={`h-5 w-5 rounded-full ${
+                        appState.allowVideoCalls ? 'bg-black' : 'bg-white/80'
+                      }`}
+                    />
+                  </div>
+                </button>
+              </div>
+
+              {/* 3. Spark-Friendly User Directory */}
+              <div className="mt-4 rounded-2xl border border-white/16 bg-black p-4">
+                <div className="flex items-center justify-between gap-2">
+                  <div className="text-[10px] font-semibold uppercase tracking-[0.18em] text-white/45">
+                    User Directory ({filteredDirectory.length})
+                  </div>
+                  <span className="font-mono text-[9.5px] text-white/35">
+                    On-demand • 25/page
+                  </span>
+                </div>
+
+                <div className="mt-2.5 flex items-center rounded-xl border border-white/14 bg-[#121212] px-3 py-2">
+                  <Search className="mr-2 h-3.5 w-3.5 text-white/40" />
+                  <input
+                    type="text"
+                    value={ownerSearch}
+                    onChange={(e) => setOwnerSearch(e.target.value)}
+                    placeholder="Filter loaded users by @username, name, or UID..."
+                    className="w-full bg-transparent text-xs text-white placeholder:text-white/30 focus:outline-none"
+                  />
+                </div>
+
+                <div className="mt-3 space-y-2.5">
+                  {filteredDirectory.length === 0 ? (
+                    <div className="rounded-xl border border-white/10 bg-[#121212] py-4 text-center text-xs text-white/45">
+                      {ownerLoading ? 'Loading directory...' : 'No users matched.'}
+                    </div>
+                  ) : (
+                    filteredDirectory.map((u) => {
+                      const isSelf = u.uid === myProfile?.uid;
+                      const isBusy = ownerActionUid === u.uid;
+                      const draftVal = badgeDrafts[u.uid] ?? u.badge ?? '';
+
+                      return (
+                        <div
+                          key={u.uid}
+                          className="rounded-xl border border-white/14 bg-[#121212] p-3 space-y-2.5"
+                        >
+                          <div className="flex items-start justify-between gap-2">
+                            <div className="min-w-0">
+                              <div className="flex items-center gap-1.5 flex-wrap">
+                                <span className="text-xs font-semibold text-white">
+                                  {u.nickname || `@${u.usernameLower}`}
+                                </span>
+                                <span className="font-mono text-[11px] text-white/55">
+                                  @{u.usernameLower}
+                                </span>
+                                {u.badge && (
+                                  <span className="rounded-full border border-white/30 bg-white/10 px-2 py-0.5 font-mono text-[9px] font-semibold uppercase tracking-wider text-white">
+                                    {u.badge}
+                                  </span>
+                                )}
+                                {u.isBanned && (
+                                  <span className="rounded-full border border-white/40 bg-white px-2 py-0.5 font-mono text-[9px] font-bold uppercase tracking-wider text-black">
+                                    BANNED
+                                  </span>
+                                )}
+                              </div>
+                              <div className="mt-0.5 truncate font-mono text-[10px] text-white/40">
+                                UID: {u.uid}
+                              </div>
+                            </div>
+
+                            <button
+                              type="button"
+                              disabled={isSelf || isBusy}
+                              onClick={() => handleToggleBan(u)}
+                              className={`flex shrink-0 items-center gap-1 rounded-lg border px-2.5 py-1.5 text-[10.5px] font-semibold transition disabled:opacity-35 ${
+                                u.isBanned
+                                  ? 'border-white bg-white text-black'
+                                  : 'border-white/25 bg-black text-white hover:bg-white hover:text-black'
+                              }`}
+                              title={isSelf ? 'Cannot ban yourself' : u.isBanned ? 'Unban user' : 'Ban user'}
+                            >
+                              <Ban className="h-3 w-3" />
+                              <span>{u.isBanned ? 'Unban' : 'Ban'}</span>
+                            </button>
+                          </div>
+
+                          {/* Custom Badge Editor */}
+                          <div className="flex items-center gap-1.5">
+                            <div className="flex flex-1 items-center rounded-lg border border-white/14 bg-black px-2.5 py-1.5">
+                              <Tag className="mr-1.5 h-3 w-3 text-white/40 shrink-0" />
+                              <input
+                                type="text"
+                                value={draftVal}
+                                onChange={(e) =>
+                                  setBadgeDrafts((prev) => ({
+                                    ...prev,
+                                    [u.uid]: e.target.value.slice(0, 16),
+                                  }))
+                                }
+                                placeholder="Badge (e.g. OWNER, FAMILY)"
+                                className="w-full bg-transparent font-mono text-[11px] text-white placeholder:text-white/25 focus:outline-none"
+                              />
+                            </div>
+                            <button
+                              type="button"
+                              disabled={isBusy}
+                              onClick={() => handleAssignBadge(u.uid, draftVal)}
+                              className="flex items-center gap-1 rounded-lg bg-white px-2.5 py-1.5 text-[10.5px] font-semibold text-black transition active:scale-95 disabled:opacity-40"
+                            >
+                              <Check className="h-3 w-3" />
+                              <span>Set</span>
+                            </button>
+                          </div>
+
+                          <div className="flex items-center gap-1.5 flex-wrap">
+                            {['OWNER', 'FAMILY', 'VIP', ''].map((preset) => (
+                              <button
+                                key={preset || 'clear'}
+                                type="button"
+                                disabled={isBusy}
+                                onClick={() => {
+                                  setBadgeDrafts((prev) => ({ ...prev, [u.uid]: preset }));
+                                  handleAssignBadge(u.uid, preset);
+                                }}
+                                className="rounded-md border border-white/14 bg-black px-2 py-0.5 font-mono text-[9.5px] text-white/65 hover:border-white/40 hover:text-white transition"
+                              >
+                                {preset || 'Clear'}
+                              </button>
+                            ))}
+                          </div>
+                        </div>
+                      );
+                    })
+                  )}
+                </div>
+
+                {ownerHasMore && (
+                  <button
+                    type="button"
+                    disabled={ownerLoading}
+                    onClick={loadMoreDirectoryUsers}
+                    className="mt-3 w-full rounded-xl border border-white/18 bg-[#121212] py-2 text-xs font-medium text-white hover:border-white/40 transition disabled:opacity-45"
+                  >
+                    {ownerLoading ? 'Loading...' : 'Load Next 25 Users'}
+                  </button>
+                )}
+              </div>
+            </div>
+          </div>
+        )}
 
         {/* Notification Bell Drawer */}
         <NotificationsDrawer

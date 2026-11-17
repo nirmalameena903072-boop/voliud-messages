@@ -12,14 +12,35 @@ service cloud.firestore {
       );
     }
 
+    function isNotBanned() {
+      return !exists(/databases/$(database)/documents/users/$(request.auth.uid)) ||
+        get(/databases/$(database)/documents/users/$(request.auth.uid)).data.get('isBanned', false) != true;
+    }
+
+    function allowNewSignups() {
+      return !exists(/databases/$(database)/documents/config/appState) ||
+        get(/databases/$(database)/documents/config/appState).data.get('allowNewSignups', true) != false;
+    }
+
+    function allowVideoCalls() {
+      return !exists(/databases/$(database)/documents/config/appState) ||
+        get(/databases/$(database)/documents/config/appState).data.get('allowVideoCalls', true) != false;
+    }
+
     function isAcceptedContact(chatId) {
       return exists(/databases/$(database)/documents/contactRequests/$(chatId)) &&
         get(/databases/$(database)/documents/contactRequests/$(chatId)).data.status == 'accepted';
     }
 
+    match /config/appState {
+      allow read: if true;
+      allow write: if isOwnerAdmin();
+    }
+
     match /usernames/{username} {
       allow read: if isSignedIn();
       allow create: if isSignedIn()
+        && allowNewSignups()
         && username.matches('^[a-z0-9_]{1,12}$')
         && request.resource.data.uid == request.auth.uid
         && request.resource.data.usernameLower == username
@@ -34,13 +55,23 @@ service cloud.firestore {
     match /users/{userId} {
       allow read: if isSignedIn();
       allow create: if isSignedIn()
+        && allowNewSignups()
         && request.auth.uid == userId
         && request.resource.data.uid == userId
-        && request.resource.data.usernameLower.matches('^[a-z0-9_]{1,12}$');
-      allow update: if isSignedIn()
+        && request.resource.data.usernameLower.matches('^[a-z0-9_]{1,12}$')
+        && request.resource.data.get('isBanned', false) == false
+        && request.resource.data.get('badge', '') == '';
+      allow update: if (
+        isSignedIn()
         && request.auth.uid == userId
         && request.resource.data.uid == userId
-        && request.resource.data.usernameLower == resource.data.usernameLower;
+        && request.resource.data.usernameLower == resource.data.usernameLower
+        && request.resource.data.get('isBanned', false) == resource.data.get('isBanned', false)
+        && request.resource.data.get('badge', '') == resource.data.get('badge', '')
+      ) || (
+        isOwnerAdmin()
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['isBanned', 'badge', 'updatedAt'])
+      );
       allow delete: if false;
     }
 
@@ -48,6 +79,7 @@ service cloud.firestore {
       allow get: if isSignedIn() && (resource == null || request.auth.uid in resource.data.participants);
       allow list: if isSignedIn() && request.auth.uid in resource.data.participants;
       allow create: if isSignedIn()
+        && isNotBanned()
         && request.resource.data.fromUid == request.auth.uid
         && request.auth.uid in request.resource.data.participants
         && request.resource.data.participants.size() == 2
@@ -76,10 +108,13 @@ service cloud.firestore {
         allow read: if isSignedIn()
           && request.auth.uid in get(/databases/$(database)/documents/chats/$(chatId)).data.participants;
         allow create: if isSignedIn()
+          && isNotBanned()
           && request.auth.uid in get(/databases/$(database)/documents/chats/$(chatId)).data.participants
           && isAcceptedContact(chatId)
-          && request.resource.data.senderUid == request.auth.uid;
+          && request.resource.data.senderUid == request.auth.uid
+          && (request.resource.data.type != 'call_invite' || allowVideoCalls());
         allow update: if isSignedIn()
+          && isNotBanned()
           && request.auth.uid in get(/databases/$(database)/documents/chats/$(chatId)).data.participants
           && isAcceptedContact(chatId);
         allow delete: if false;
@@ -90,6 +125,7 @@ service cloud.firestore {
       allow get: if isSignedIn() && (resource == null || request.auth.uid in resource.data.members || isOwnerAdmin());
       allow list: if isSignedIn() && (request.auth.uid in resource.data.members || isOwnerAdmin());
       allow create: if isSignedIn()
+        && isNotBanned()
         && request.auth.uid in request.resource.data.members
         && request.auth.uid in request.resource.data.admins;
       allow update: if isSignedIn()
@@ -117,13 +153,16 @@ service cloud.firestore {
         allow read: if isSignedIn()
           && request.auth.uid in get(/databases/$(database)/documents/groups/$(groupId)).data.members;
         allow create: if isSignedIn()
+          && isNotBanned()
           && request.auth.uid in get(/databases/$(database)/documents/groups/$(groupId)).data.members
           && request.resource.data.senderUid == request.auth.uid
+          && (request.resource.data.type != 'call_invite' || allowVideoCalls())
           && (
             !get(/databases/$(database)/documents/groups/$(groupId)).data.permissions.onlyAdminsSendMessages
             || request.auth.uid in get(/databases/$(database)/documents/groups/$(groupId)).data.admins
           );
         allow update: if isSignedIn()
+          && isNotBanned()
           && request.auth.uid in get(/databases/$(database)/documents/groups/$(groupId)).data.members;
         allow delete: if false;
       }

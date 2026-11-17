@@ -362,6 +362,7 @@ export function ChatRoom({
   myProfile,
   messages,
   typingUsers,
+  allowVideoCalls = true,
   onBack,
   onOpenGroupInfo,
   onSendMessage,
@@ -388,8 +389,10 @@ export function ChatRoom({
 
   const isGroup = chatType === 'group';
   const myUid = myProfile.uid;
+  const isBanned = Boolean(myProfile?.isBanned);
   const isAdmin = isGroup ? (group?.admins || []).includes(myUid) : false;
-  const sendLocked = isGroup && group?.permissions?.onlyAdminsSendMessages && !isAdmin;
+  const groupSendLocked = isGroup && group?.permissions?.onlyAdminsSendMessages && !isAdmin;
+  const sendLocked = isBanned || groupSendLocked;
 
   // Live clock tick when any ringing call invite exists
   const hasRingingCall = messages.some(
@@ -495,7 +498,7 @@ export function ChatRoom({
     : peer?.status || 'Online';
 
   return (
-    <div className="flex h-[100dvh] w-full flex-col bg-black">
+    <div className="flex h-full w-full flex-col bg-black">
       {/* Sticky Spatial Chat Header */}
       <header className="flex shrink-0 items-center justify-between gap-2 border-b border-white/14 bg-[#080808]/95 px-3 py-3 backdrop-blur-md">
         <div className="flex items-center gap-2.5 min-w-0 flex-1">
@@ -534,7 +537,14 @@ export function ChatRoom({
             )}
 
             <div className="min-w-0">
-              <div className="truncate text-sm font-semibold text-white">{title}</div>
+              <div className="flex items-center gap-1.5 min-w-0">
+                <span className="truncate text-sm font-semibold text-white">{title}</span>
+                {!isGroup && peer?.badge && (
+                  <span className="shrink-0 rounded-full border border-white/25 bg-white/10 px-1.5 py-0.5 font-mono text-[8.5px] font-semibold uppercase tracking-wider text-white">
+                    {peer.badge}
+                  </span>
+                )}
+              </div>
               <div className="flex items-center gap-1.5 truncate text-[11px] text-white/55">
                 {!isGroup && <StatusDot status={peer?.status || 'Online'} />}
                 <span className="truncate">{subtitle}</span>
@@ -546,10 +556,14 @@ export function ChatRoom({
         <div className="flex items-center gap-2 shrink-0">
           <button
             type="button"
-            disabled={sendLocked}
+            disabled={sendLocked || !allowVideoCalls}
             onClick={onSendCallInvite}
-            className="flex h-9 w-9 items-center justify-center rounded-full border border-white/20 bg-[#161616] text-white hover:bg-white hover:text-black transition disabled:opacity-35"
-            title="Start 45s Jitsi Video Call"
+            className="flex h-9 w-9 items-center justify-center rounded-full border border-white/20 bg-[#161616] text-white hover:bg-white hover:text-black transition disabled:opacity-30"
+            title={
+              !allowVideoCalls
+                ? '45s Video Calls are disabled by administrator'
+                : 'Start 45s Jitsi Video Call'
+            }
             aria-label="Start Jitsi Video Call"
           >
             <Video className="h-4 w-4" />
@@ -841,7 +855,11 @@ export function ChatRoom({
         {sendLocked ? (
           <div className="flex items-center justify-center gap-2 rounded-2xl border border-white/14 bg-[#121212] py-3 text-xs text-white/55">
             <Lock className="h-3.5 w-3.5" />
-            <span>Only group admins can send messages.</span>
+            <span>
+              {isBanned
+                ? 'Your account is restricted from sending messages.'
+                : 'Only group admins can send messages.'}
+            </span>
           </div>
         ) : (
           <form onSubmit={handleSubmit} className="flex items-center gap-2">

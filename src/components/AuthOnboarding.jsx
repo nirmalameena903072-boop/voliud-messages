@@ -51,7 +51,7 @@ export function FirebaseSetupBanner({ onEnterDemo }) {
 
 export function LoginScreen({ onGoogleSignIn, loading, error, onEnterDemo }) {
   return (
-    <div className="flex h-[100dvh] w-full flex-col justify-between overflow-y-auto px-5 py-6">
+    <div className="flex h-full w-full flex-col justify-between overflow-y-auto px-5 py-6">
       <div className="space-y-4">
         {!isFirebaseConfigured && <FirebaseSetupBanner onEnterDemo={onEnterDemo} />}
       </div>
@@ -112,7 +112,14 @@ export function LoginScreen({ onGoogleSignIn, loading, error, onEnterDemo }) {
   );
 }
 
-export function OnboardingCard({ initialNickname = '', onComplete, loading, error, onSignOut }) {
+export function OnboardingCard({
+  initialNickname = '',
+  allowNewSignups = true,
+  onComplete,
+  loading,
+  error,
+  onSignOut,
+}) {
   const [username, setUsername] = useState('');
   const [nickname, setNickname] = useState(initialNickname);
   const [localError, setLocalError] = useState('');
@@ -125,6 +132,10 @@ export function OnboardingCard({ initialNickname = '', onComplete, loading, erro
 
   const handleSubmit = (e) => {
     e.preventDefault();
+    if (!allowNewSignups) {
+      setLocalError('New sign-ups are currently paused by the administrator.');
+      return;
+    }
     if (!username || username.length < 2) {
       setLocalError('Choose a handle between 2 and 12 characters ([a-z0-9_]).');
       return;
@@ -139,7 +150,7 @@ export function OnboardingCard({ initialNickname = '', onComplete, loading, erro
   const displayErr = localError || error;
 
   return (
-    <div className="flex h-[100dvh] w-full flex-col justify-center px-5 py-6">
+    <div className="flex h-full w-full flex-col justify-center px-5 py-6">
       <Tilt3DCard
         intensity={6}
         className="animate-card-3d-in rounded-[28px] border border-white/18 bg-[#0D0D0D] p-6 shadow-spatial-card"
@@ -218,6 +229,12 @@ export function OnboardingCard({ initialNickname = '', onComplete, loading, erro
             />
           </div>
 
+          {!allowNewSignups && (
+            <div className="rounded-xl border border-white/25 bg-[#161616] px-3.5 py-2.5 text-xs text-white/85">
+              New sign-ups are currently disabled by the owner. Please check back later.
+            </div>
+          )}
+
           {displayErr && (
             <div className="rounded-xl border border-white/25 bg-[#161616] px-3.5 py-2.5 text-xs text-white/90">
               {displayErr}
@@ -226,7 +243,7 @@ export function OnboardingCard({ initialNickname = '', onComplete, loading, erro
 
           <button
             type="submit"
-            disabled={loading}
+            disabled={loading || !allowNewSignups}
             className="mt-2 flex w-full items-center justify-center gap-2 rounded-2xl bg-white px-5 py-3.5 text-sm font-semibold text-black shadow-spatial-white transition hover:bg-white/90 active:scale-[0.98] disabled:opacity-50"
           >
             <span>{loading ? 'Reserving handle...' : 'Enter Voliud'}</span>
