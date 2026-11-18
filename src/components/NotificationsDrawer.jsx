@@ -53,6 +53,14 @@ export function NotificationsDrawer({
             <div className="mt-2 space-y-2.5">
               {incomingRequests.map((req) => {
                 const isBusy = busyPairId === req.id;
+                const senderName =
+                  req.fromName ||
+                  req.fromNickname ||
+                  (req.fromUsername ? `@${req.fromUsername}` : req.fromEmail || 'Voliud User');
+                const senderSub = req.fromUsername
+                  ? `@${req.fromUsername}${req.fromEmail ? ` • ${req.fromEmail}` : ''}`
+                  : req.fromEmail || req.from || '';
+
                 return (
                   <div
                     key={req.id}
@@ -61,16 +69,16 @@ export function NotificationsDrawer({
                     <div className="flex items-center gap-3 min-w-0">
                       <AvatarRing3D
                         src={req.fromPhotoURL}
-                        name={req.fromNickname || req.fromUsername}
+                        name={senderName}
                         size={38}
                         animated={false}
                       />
                       <div className="min-w-0">
                         <div className="truncate text-sm font-semibold text-white">
-                          {req.fromNickname || `@${req.fromUsername}`}
+                          {senderName}
                         </div>
                         <div className="truncate font-mono text-xs text-white/50">
-                          @{req.fromUsername}
+                          {senderSub}
                         </div>
                       </div>
                     </div>
@@ -116,6 +124,14 @@ export function NotificationsDrawer({
             <div className="mt-2 space-y-2.5">
               {outgoingRequests.map((req) => {
                 const isBusy = busyPairId === req.id;
+                const receiverName =
+                  req.toName ||
+                  req.toNickname ||
+                  (req.toUsername ? `@${req.toUsername}` : req.toEmail || 'Voliud User');
+                const receiverSub = req.toUsername
+                  ? `@${req.toUsername}`
+                  : req.toEmail || req.to || '';
+
                 return (
                   <div
                     key={req.id}
@@ -124,17 +140,17 @@ export function NotificationsDrawer({
                     <div className="flex items-center gap-3 min-w-0">
                       <AvatarRing3D
                         src={req.toPhotoURL}
-                        name={req.toNickname || req.toUsername}
+                        name={receiverName}
                         size={36}
                         animated={false}
                       />
                       <div className="min-w-0">
                         <div className="truncate text-sm font-medium text-white">
-                          {req.toNickname || `@${req.toUsername}`}
+                          {receiverName}
                         </div>
                         <div className="flex items-center gap-1 font-mono text-[11px] text-white/45">
-                          <Clock className="h-3 w-3" />
-                          <span>@{req.toUsername} • Waiting</span>
+                          <Clock className="h-3 w-3 shrink-0" />
+                          <span className="truncate">{receiverSub} • Waiting</span>
                         </div>
                       </div>
                     </div>
@@ -143,7 +159,7 @@ export function NotificationsDrawer({
                       type="button"
                       disabled={isBusy}
                       onClick={() => onCancelOutgoing(req)}
-                      className="rounded-xl border border-white/15 bg-[#161616] px-3 py-1.5 text-[11px] text-white/70 hover:text-white transition disabled:opacity-40"
+                      className="shrink-0 rounded-xl border border-white/15 bg-[#161616] px-3 py-1.5 text-[11px] text-white/70 hover:text-white transition disabled:opacity-40"
                     >
                       Cancel
                     </button>

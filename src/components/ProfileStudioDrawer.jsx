@@ -294,7 +294,7 @@ export function ProfileStudioDrawer({
                 Owner / Admin Console
               </span>
               <span className="font-mono text-[10px] uppercase tracking-wider opacity-70">
-                UID Locked
+                Admin Role
               </span>
             </button>
           )}

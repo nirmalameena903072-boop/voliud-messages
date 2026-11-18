@@ -1,9 +1,7 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
-  getRedirectResult,
   onAuthStateChanged,
   signInWithPopup,
-  signInWithRedirect,
   signOut,
 } from 'firebase/auth';
 import {
@@ -27,9 +25,11 @@ import {
 } from 'firebase/firestore';
 import { onDisconnect, onValue, ref as rtdbRef, remove as rtdbRemove, set as rtdbSet } from 'firebase/database';
 import {
+  AlertTriangle,
   Ban,
   Bell,
   Check,
+  FileText,
   Home,
   Megaphone,
   MessageSquare,
@@ -39,12 +39,13 @@ import {
   Shield,
   Sparkles,
   Tag,
+  UserCheck,
   UserPlus,
   Users,
   Video,
   X,
 } from 'lucide-react';
-import { OWNER_UID, auth, db, googleProvider, isFirebaseConfigured, rtdb } from './firebase';
+import { auth, db, googleProvider, isFirebaseConfigured, rtdb } from './firebase';
 import {
   MAX_BIO_LENGTH,
   MAX_GROUP_NAME_LENGTH,
@@ -72,9 +73,17 @@ function normalizeHandle(raw) {
 
 function formatFirestoreError(err, fallback = 'Firestore operation failed.') {
   if (!err) return fallback;
-  const code = err.code ? `[${err.code}] ` : '';
-  const msg = err.message || (typeof err === 'string' ? err : fallback);
-  return `${code}${msg}`;
+  if (err.code && err.message) return `${err.code}: ${err.message}`;
+  if (err.code) return `${err.code}: ${fallback}`;
+  return err.message || (typeof err === 'string' ? err : fallback);
+}
+
+function getMillis(ts, fallback = 0) {
+  if (!ts) return fallback;
+  if (typeof ts.toMillis === 'function') return ts.toMillis();
+  if (typeof ts.seconds === 'number') return ts.seconds * 1000;
+  if (typeof ts === 'number') return ts;
+  return fallback;
 }
 
 export default function App() {
@@ -92,6 +101,8 @@ export default function App() {
   const [isOwnerAdmin, setIsOwnerAdmin] = useState(false);
   const [adminVerified, setAdminVerified] = useState(!isFirebaseConfigured);
   const [rateLimitNotice, setRateLimitNotice] = useState('');
+  const [appError, setAppError] = useState('');
+  const [appStatus, setAppStatus] = useState('');
 
   // ?add=username URL detection
   const [pendingAddUsername, setPendingAddUsername] = useState(() => {
@@ -104,10 +115,16 @@ export default function App() {
   const [searchInput, setSearchInput] = useState('');
   const [searchResult, setSearchResult] = useState(null);
   const [searchError, setSearchError] = useState('');
+  const [contactStatusMessage, setContactStatusMessage] = useState('');
   const [searching, setSearching] = useState(false);
 
   // Social Graph & Chats
-  const [contactRequests, setContactRequests] = useState([]);
+  const [incomingPendingReqs, setIncomingPendingReqs] = useState([]);
+  const [outgoingPendingReqs, setOutgoingPendingReqs] = useState([]);
+  const [acceptedFromReqs, setAcceptedFromReqs] = useState([]);
+  const [acceptedToReqs, setAcceptedToReqs] = useState([]);
+  const [legacyRequests, setLegacyRequests] = useState([]);
+  const [userContactsDocs, setUserContactsDocs] = useState([]);
   const [userProfilesMap, setUserProfilesMap] = useState({});
   const [directChatsMap, setDirectChatsMap] = useState({});
   const [groups, setGroups] = useState([]);
@@ -143,6 +160,8 @@ export default function App() {
   const [ownerLoading, setOwnerLoading] = useState(false);
   const [ownerError, setOwnerError] = useState('');
   const [ownerNotice, setOwnerNotice] = useState('');
+  const [ownerReports, setOwnerReports] = useState([]);
+  const [ownerLogs, setOwnerLogs] = useState([]);
   const [announcementActiveDraft, setAnnouncementActiveDraft] = useState(false);
   const [announcementTextDraft, setAnnouncementTextDraft] = useState('');
   const [announcementSaving, setAnnouncementSaving] = useState(false);
@@ -153,6 +172,8 @@ export default function App() {
   const [demoMessagesByChat, setDemoMessagesByChat] = useState({});
   const typingTimerRef = useRef(null);
   const rateNoticeTimerRef = useRef(null);
+  const statusTimerRef = useRef(null);
+  const syncedLoginUidRef = useRef('');
 
   // Client-side rate limiters (anti-spam / cooldown defense in depth)
   const messageLimiterRef = useRef(
@@ -170,6 +191,54 @@ export default function App() {
     if (rateNoticeTimerRef.current) clearTimeout(rateNoticeTimerRef.current);
     rateNoticeTimerRef.current = setTimeout(() => setRateLimitNotice(''), 3200);
   };
+
+  const showAppError = useCallback((context, err) => {
+    const formatted = formatFirestoreError(err, 'Unexpected error.');
+    setAppError(context ? `${context}: ${formatted}` : formatted);
+  }, []);
+
+  const showAppStatus = useCallback((msg) => {
+    setAppStatus(msg);
+    if (statusTimerRef.current) clearTimeout(statusTimerRef.current);
+    statusTimerRef.current = setTimeout(() => setAppStatus(''), 3500);
+  }, []);
+
+  const syncUserProfileOnLogin = useCallback(async (user) => {
+    if (!isFirebaseConfigured || !db || !user?.uid) return null;
+    const userRef = doc(db, 'users', user.uid);
+    const normalizedEmail = (user.email || '').trim().toLowerCase();
+    const displayName = user.displayName || '';
+    const photoURL = user.photoURL || '';
+
+    try {
+      const snap = await getDoc(userRef);
+      if (!snap.exists()) {
+        await setDoc(userRef, {
+          uid: user.uid,
+          email: normalizedEmail,
+          displayName,
+          photoURL,
+          role: 'user',
+          createdAt: serverTimestamp(),
+        });
+      } else {
+        await setDoc(
+          userRef,
+          {
+            email: normalizedEmail,
+            displayName,
+            photoURL,
+            lastLoginAt: serverTimestamp(),
+          },
+          { merge: true }
+        );
+      }
+      return snap.exists() ? snap.data() : null;
+    } catch (err) {
+      showAppError('Profile login sync failed', err);
+      return null;
+    }
+  }, [showAppError]);
 
   // ---------------------------------------------------------------------------
   // 0. Global App State Listener (config/appState - single doc, Spark friendly)
@@ -197,26 +266,23 @@ export default function App() {
           });
         }
       },
-      () => {}
+      (err) => showAppError('Global config listener failed', err)
     );
 
     return () => unsub();
-  }, []);
+  }, [showAppError]);
 
   // ---------------------------------------------------------------------------
-  // 1. Firebase Auth Listener & Redirect Handling
+  // 1. Firebase Auth Listener & Login Profile Sync
   // ---------------------------------------------------------------------------
   useEffect(() => {
     if (!isFirebaseConfigured || !auth) return;
-
-    getRedirectResult(auth).catch((err) => {
-      if (err?.message) setAuthError(err.message);
-    });
 
     const unsub = onAuthStateChanged(auth, async (user) => {
       setAuthUser(user);
       setAuthReady(true);
       if (!user) {
+        syncedLoginUidRef.current = '';
         setMyProfile(null);
         setIsOwnerAdmin(false);
         setAdminVerified(false);
@@ -228,17 +294,24 @@ export default function App() {
         setGroupInfoOpen(false);
         setOwnerDirectory([]);
         setOwnerStats({ users: null, groups: null });
+        setOwnerReports([]);
+        setOwnerLogs([]);
+        return;
+      }
+
+      if (syncedLoginUidRef.current !== user.uid) {
+        syncedLoginUidRef.current = user.uid;
+        await syncUserProfileOnLogin(user);
       }
     });
 
     return () => unsub();
-  }, []);
+  }, [syncUserProfileOnLogin]);
 
-  // Subscribe to myProfile & check admins/{uid}
+  // Subscribe to live users/{uid} document; derive admin strictly from role === 'admin' || isAdmin === true
   useEffect(() => {
     if (!isFirebaseConfigured || !db || !authUser) return;
 
-    let cancelled = false;
     setProfileLoading(true);
     setAdminVerified(false);
     setIsOwnerAdmin(false);
@@ -248,87 +321,180 @@ export default function App() {
       userDocRef,
       (snap) => {
         if (snap.exists()) {
-          setMyProfile({ uid: snap.id, ...snap.data() });
+          const data = { uid: snap.id, ...snap.data() };
+          setMyProfile(data);
+          const verifiedAdmin = data.role === 'admin' || data.isAdmin === true;
+          setIsOwnerAdmin(verifiedAdmin);
+          setAdminVerified(true);
+          if (!verifiedAdmin) setOwnerConsoleOpen(false);
         } else {
           setMyProfile(null);
+          setIsOwnerAdmin(false);
+          setAdminVerified(true);
+          setOwnerConsoleOpen(false);
         }
         setProfileLoading(false);
       },
-      () => {
+      (err) => {
         setProfileLoading(false);
+        setIsOwnerAdmin(false);
+        setAdminVerified(true);
+        showAppError('User profile listener failed', err);
       }
     );
 
-    const matchesOwnerUid = Boolean(OWNER_UID && authUser.uid === OWNER_UID);
-    const adminRef = doc(db, 'admins', authUser.uid);
-    getDoc(adminRef)
-      .then((snap) => {
-        if (cancelled) return;
-        const verified = matchesOwnerUid || snap.exists();
-        setIsOwnerAdmin(verified);
-        setAdminVerified(true);
-        if (!verified) setOwnerConsoleOpen(false);
-      })
-      .catch(() => {
-        if (cancelled) return;
-        setIsOwnerAdmin(matchesOwnerUid);
-        setAdminVerified(true);
-        if (!matchesOwnerUid) setOwnerConsoleOpen(false);
-      });
-
     return () => {
-      cancelled = true;
       unsubUser();
     };
-  }, [authUser]);
+  }, [authUser, showAppError]);
 
   // ---------------------------------------------------------------------------
-  // 2. Social Graph Listeners (Contact Requests, Direct Chats, Groups)
+  // 2. Social Graph Listeners (Contact Requests, Contacts, Direct Chats, Groups)
   // ---------------------------------------------------------------------------
   useEffect(() => {
-    if (!isFirebaseConfigured || !db || !myProfile) return;
+    if (!isFirebaseConfigured || !db || !myProfile?.uid) return;
+    const myUid = myProfile.uid;
 
-    const reqQuery = query(
+    // Receiver real-time listener: strictly where('to', '==', uid) + where('status', '==', 'pending'), sorted in JS
+    const incomingQuery = query(
       collection(db, 'contactRequests'),
-      where('participants', 'array-contains', myProfile.uid)
+      where('to', '==', myUid),
+      where('status', '==', 'pending')
     );
-    const unsubReqs = onSnapshot(reqQuery, (snap) => {
-      const list = snap.docs.map((d) => ({ id: d.id, ...d.data() }));
-      setContactRequests(list);
-    });
+    const unsubIncoming = onSnapshot(
+      incomingQuery,
+      (snap) => {
+        const list = snap.docs
+          .map((d) => ({ id: d.id, ...d.data() }))
+          .sort((a, b) => getMillis(b.createdAt, b.createdAtMs) - getMillis(a.createdAt, a.createdAtMs));
+        setIncomingPendingReqs(list);
+      },
+      (err) => showAppError('Incoming contact requests listener failed', err)
+    );
+
+    const outgoingQuery = query(
+      collection(db, 'contactRequests'),
+      where('from', '==', myUid),
+      where('status', '==', 'pending')
+    );
+    const unsubOutgoing = onSnapshot(
+      outgoingQuery,
+      (snap) => {
+        const list = snap.docs
+          .map((d) => ({ id: d.id, ...d.data() }))
+          .sort((a, b) => getMillis(b.createdAt, b.createdAtMs) - getMillis(a.createdAt, a.createdAtMs));
+        setOutgoingPendingReqs(list);
+      },
+      (err) => showAppError('Outgoing contact requests listener failed', err)
+    );
+
+    const acceptedToQuery = query(
+      collection(db, 'contactRequests'),
+      where('to', '==', myUid),
+      where('status', '==', 'accepted')
+    );
+    const unsubAcceptedTo = onSnapshot(
+      acceptedToQuery,
+      (snap) => {
+        setAcceptedToReqs(snap.docs.map((d) => ({ id: d.id, ...d.data() })));
+      },
+      (err) => showAppError('Accepted requests (incoming) listener failed', err)
+    );
+
+    const acceptedFromQuery = query(
+      collection(db, 'contactRequests'),
+      where('from', '==', myUid),
+      where('status', '==', 'accepted')
+    );
+    const unsubAcceptedFrom = onSnapshot(
+      acceptedFromQuery,
+      (snap) => {
+        setAcceptedFromReqs(snap.docs.map((d) => ({ id: d.id, ...d.data() })));
+      },
+      (err) => showAppError('Accepted requests (outgoing) listener failed', err)
+    );
+
+    const legacyReqQuery = query(
+      collection(db, 'contactRequests'),
+      where('participants', 'array-contains', myUid)
+    );
+    const unsubLegacyReqs = onSnapshot(
+      legacyReqQuery,
+      (snap) => {
+        setLegacyRequests(snap.docs.map((d) => ({ id: d.id, ...d.data() })));
+      },
+      (err) => showAppError('Legacy requests listener failed', err)
+    );
+
+    const contactsSubRef = collection(db, 'users', myUid, 'contacts');
+    const unsubContacts = onSnapshot(
+      contactsSubRef,
+      (snap) => {
+        setUserContactsDocs(snap.docs.map((d) => ({ uid: d.id, ...d.data() })));
+      },
+      (err) => showAppError('Contacts listener failed', err)
+    );
 
     const chatsQuery = query(
       collection(db, 'chats'),
-      where('participants', 'array-contains', myProfile.uid)
+      where('participants', 'array-contains', myUid)
     );
-    const unsubChats = onSnapshot(chatsQuery, (snap) => {
-      const map = {};
-      snap.docs.forEach((d) => {
-        map[d.id] = { id: d.id, ...d.data() };
-      });
-      setDirectChatsMap(map);
-    });
+    const unsubChats = onSnapshot(
+      chatsQuery,
+      (snap) => {
+        const map = {};
+        snap.docs.forEach((d) => {
+          map[d.id] = { id: d.id, ...d.data() };
+        });
+        setDirectChatsMap(map);
+      },
+      (err) => showAppError('Chats listener failed', err)
+    );
 
     const groupsQuery = query(
       collection(db, 'groups'),
-      where('members', 'array-contains', myProfile.uid)
+      where('members', 'array-contains', myUid)
     );
-    const unsubGroups = onSnapshot(groupsQuery, (snap) => {
-      const list = snap.docs.map((d) => ({ id: d.id, ...d.data() }));
-      list.sort((a, b) => {
-        const ta = a.updatedAt?.toMillis?.() || a.updatedAtMs || 0;
-        const tb = b.updatedAt?.toMillis?.() || b.updatedAtMs || 0;
-        return tb - ta;
-      });
-      setGroups(list);
-    });
+    const unsubGroups = onSnapshot(
+      groupsQuery,
+      (snap) => {
+        const list = snap.docs.map((d) => ({ id: d.id, ...d.data() }));
+        list.sort((a, b) => {
+          const ta = getMillis(a.updatedAt, a.updatedAtMs);
+          const tb = getMillis(b.updatedAt, b.updatedAtMs);
+          return tb - ta;
+        });
+        setGroups(list);
+      },
+      (err) => showAppError('Groups listener failed', err)
+    );
 
     return () => {
-      unsubReqs();
+      unsubIncoming();
+      unsubOutgoing();
+      unsubAcceptedTo();
+      unsubAcceptedFrom();
+      unsubLegacyReqs();
+      unsubContacts();
       unsubChats();
       unsubGroups();
     };
-  }, [myProfile?.uid]);
+  }, [myProfile?.uid, showAppError]);
+
+  // Unified view of contact requests across new and legacy schemas
+  const contactRequests = useMemo(() => {
+    const byId = new Map();
+    [
+      ...incomingPendingReqs,
+      ...outgoingPendingReqs,
+      ...acceptedToReqs,
+      ...acceptedFromReqs,
+      ...legacyRequests,
+    ].forEach((r) => {
+      if (r?.id) byId.set(r.id, r);
+    });
+    return Array.from(byId.values());
+  }, [incomingPendingReqs, outgoingPendingReqs, acceptedToReqs, acceptedFromReqs, legacyRequests]);
 
   // Keep live user profiles synced for accepted contacts + group members
   useEffect(() => {
@@ -337,8 +503,13 @@ export default function App() {
     const uidsToWatch = new Set([myProfile.uid]);
     contactRequests.forEach((r) => {
       if (r.status === 'accepted') {
+        if (r.from) uidsToWatch.add(r.from);
+        if (r.to) uidsToWatch.add(r.to);
         (r.participants || []).forEach((id) => uidsToWatch.add(id));
       }
+    });
+    userContactsDocs.forEach((c) => {
+      if (c.uid) uidsToWatch.add(c.uid);
     });
     groups.forEach((g) => {
       (g.members || []).forEach((id) => uidsToWatch.add(id));
@@ -346,16 +517,20 @@ export default function App() {
 
     const unsubs = [];
     uidsToWatch.forEach((uid) => {
-      const unsub = onSnapshot(doc(db, 'users', uid), (snap) => {
-        if (snap.exists()) {
-          setUserProfilesMap((prev) => ({ ...prev, [uid]: { uid: snap.id, ...snap.data() } }));
-        }
-      });
+      const unsub = onSnapshot(
+        doc(db, 'users', uid),
+        (snap) => {
+          if (snap.exists()) {
+            setUserProfilesMap((prev) => ({ ...prev, [uid]: { uid: snap.id, ...snap.data() } }));
+          }
+        },
+        (err) => showAppError(`User profile sync (${uid}) failed`, err)
+      );
       unsubs.push(unsub);
     });
 
     return () => unsubs.forEach((u) => u());
-  }, [myProfile?.uid, contactRequests, groups]);
+  }, [myProfile?.uid, contactRequests, userContactsDocs, groups, showAppError]);
 
   // ---------------------------------------------------------------------------
   // 3. Read-Optimized Active Chat Listener (orderBy createdAt desc, limit(30))
@@ -377,20 +552,24 @@ export default function App() {
     const msgRef = collection(db, colName, activeChat.id, 'messages');
     const q = query(msgRef, orderBy('createdAt', 'desc'), limit(30));
 
-    const unsub = onSnapshot(q, (snap) => {
-      const docs = snap.docs
-        .map((d) => {
-          const data = d.data();
-          const createdAtMs =
-            data.createdAt?.toMillis?.() || data.createdAtMs || Date.now();
-          return { id: d.id, ...data, createdAtMs };
-        })
-        .reverse();
-      setMessages(docs);
-    });
+    const unsub = onSnapshot(
+      q,
+      (snap) => {
+        const docs = snap.docs
+          .map((d) => {
+            const data = d.data();
+            const createdAtMs =
+              data.createdAt?.toMillis?.() || data.createdAtMs || Date.now();
+            return { id: d.id, ...data, createdAtMs };
+          })
+          .reverse();
+        setMessages(docs);
+      },
+      (err) => showAppError('Messages listener failed', err)
+    );
 
     return () => unsub();
-  }, [activeChat?.id, activeChat?.type, demoMode, demoMessagesByChat]);
+  }, [activeChat?.id, activeChat?.type, demoMode, demoMessagesByChat, showAppError]);
 
   // ---------------------------------------------------------------------------
   // 4. RTDB Typing Listener + Cleanup
@@ -407,18 +586,22 @@ export default function App() {
     }
 
     const chatTypingRef = rtdbRef(rtdb, `typing/${activeChat.id}`);
-    const unsub = onValue(chatTypingRef, (snap) => {
-      const val = snap.val();
-      if (!val) {
-        setTypingUsers([]);
-        return;
-      }
-      const now = Date.now();
-      const others = Object.entries(val)
-        .filter(([uid, info]) => uid !== myProfile.uid && info && now - (info.updatedAt || 0) < 5500)
-        .map(([uid, info]) => ({ uid, username: info.username || 'user' }));
-      setTypingUsers(others);
-    });
+    const unsub = onValue(
+      chatTypingRef,
+      (snap) => {
+        const val = snap.val();
+        if (!val) {
+          setTypingUsers([]);
+          return;
+        }
+        const now = Date.now();
+        const others = Object.entries(val)
+          .filter(([uid, info]) => uid !== myProfile.uid && info && now - (info.updatedAt || 0) < 5500)
+          .map(([uid, info]) => ({ uid, username: info.username || 'user' }));
+        setTypingUsers(others);
+      },
+      (err) => showAppError('Typing indicator listener failed', err)
+    );
 
     const myTypingRef = rtdbRef(rtdb, `typing/${activeChat.id}/${myProfile.uid}`);
     onDisconnect(myTypingRef).remove();
@@ -428,7 +611,7 @@ export default function App() {
       clearTimeout(typingTimerRef.current);
       rtdbRemove(myTypingRef).catch(() => {});
     };
-  }, [activeChat?.id, myProfile?.uid, demoMode]);
+  }, [activeChat?.id, myProfile?.uid, demoMode, showAppError]);
 
   // ---------------------------------------------------------------------------
   // 5. ?add=username Auto-Popup Lookup
@@ -463,73 +646,151 @@ export default function App() {
     [demoMode, userProfilesMap]
   );
 
+  const lookupUserByEmail = useCallback(
+    async (rawEmail) => {
+      const normalizedEmail = (rawEmail || '').trim().toLowerCase();
+      if (!normalizedEmail) return null;
+
+      if (demoMode) {
+        const found = Object.values(userProfilesMap).find(
+          (u) => (u.email || '').trim().toLowerCase() === normalizedEmail
+        );
+        return found || null;
+      }
+
+      if (!isFirebaseConfigured || !db) return null;
+
+      const emailQuery = query(
+        collection(db, 'users'),
+        where('email', '==', normalizedEmail),
+        limit(1)
+      );
+      const snap = await getDocs(emailQuery);
+      if (snap.empty) return null;
+      const d = snap.docs[0];
+      return { uid: d.id, ...d.data() };
+    },
+    [demoMode, userProfilesMap]
+  );
+
   useEffect(() => {
     if (!pendingAddUsername || !myProfile) return;
 
     let cancelled = false;
-    lookupUserByHandle(pendingAddUsername).then((found) => {
-      if (cancelled) return;
-      if (found) {
-        setInviteModalUser(found);
-      }
-      setPendingAddUsername('');
-      if (window.location.search.includes('add=')) {
-        window.history.replaceState({}, '', window.location.pathname);
-      }
-    });
+    lookupUserByHandle(pendingAddUsername)
+      .then((found) => {
+        if (cancelled) return;
+        if (found) {
+          setInviteModalUser(found);
+        }
+        setPendingAddUsername('');
+        if (window.location.search.includes('add=')) {
+          window.history.replaceState({}, '', window.location.pathname);
+        }
+      })
+      .catch((err) => {
+        if (!cancelled) showAppError('Invite lookup failed', err);
+      });
 
     return () => {
       cancelled = true;
     };
-  }, [pendingAddUsername, myProfile, lookupUserByHandle]);
+  }, [pendingAddUsername, myProfile, lookupUserByHandle, showAppError]);
 
   // ---------------------------------------------------------------------------
   // Derived Lists
   // ---------------------------------------------------------------------------
   const incomingRequests = useMemo(
-    () => contactRequests.filter((r) => r.status === 'pending' && r.toUid === myProfile?.uid),
+    () =>
+      contactRequests
+        .filter((r) => r.status === 'pending' && (r.to === myProfile?.uid || r.toUid === myProfile?.uid))
+        .sort((a, b) => getMillis(b.createdAt, b.createdAtMs) - getMillis(a.createdAt, a.createdAtMs)),
     [contactRequests, myProfile?.uid]
   );
 
   const outgoingRequests = useMemo(
-    () => contactRequests.filter((r) => r.status === 'pending' && r.fromUid === myProfile?.uid),
+    () =>
+      contactRequests
+        .filter((r) => r.status === 'pending' && (r.from === myProfile?.uid || r.fromUid === myProfile?.uid))
+        .sort((a, b) => getMillis(b.createdAt, b.createdAtMs) - getMillis(a.createdAt, a.createdAtMs)),
     [contactRequests, myProfile?.uid]
   );
 
   const acceptedContacts = useMemo(() => {
     if (!myProfile) return [];
-    return contactRequests
+    const byUid = new Map();
+
+    userContactsDocs.forEach((c) => {
+      if (!c.uid || c.uid === myProfile.uid) return;
+      const liveProfile = userProfilesMap[c.uid];
+      byUid.set(c.uid, liveProfile || c);
+    });
+
+    contactRequests
       .filter((r) => r.status === 'accepted')
-      .map((r) => {
-        const peerUid = (r.participants || []).find((id) => id !== myProfile.uid);
+      .forEach((r) => {
+        const peerUid =
+          r.from && r.to
+            ? r.from === myProfile.uid
+              ? r.to
+              : r.from
+            : (r.participants || []).find((id) => id !== myProfile.uid);
+        if (!peerUid || peerUid === myProfile.uid) return;
         const liveProfile = userProfilesMap[peerUid];
-        if (liveProfile) return liveProfile;
-        const isPeerFrom = r.fromUid === peerUid;
-        return {
-          uid: peerUid,
-          usernameLower: isPeerFrom ? r.fromUsername : r.toUsername,
-          nickname: isPeerFrom ? r.fromNickname : r.toNickname,
-          photoURL: isPeerFrom ? r.fromPhotoURL : r.toPhotoURL,
-          status: 'Online',
-        };
-      })
-      .filter((c) => c.uid);
-  }, [contactRequests, myProfile, userProfilesMap]);
+        if (liveProfile) {
+          byUid.set(peerUid, liveProfile);
+          return;
+        }
+        if (!byUid.has(peerUid)) {
+          const isPeerFrom = (r.from || r.fromUid) === peerUid;
+          byUid.set(peerUid, {
+            uid: peerUid,
+            usernameLower: isPeerFrom ? r.fromUsername || '' : r.toUsername || '',
+            email: isPeerFrom ? r.fromEmail || '' : r.toEmail || '',
+            displayName: isPeerFrom ? r.fromName || '' : r.toName || '',
+            nickname: isPeerFrom
+              ? r.fromName || r.fromNickname || r.fromEmail || ''
+              : r.toName || r.toNickname || r.toEmail || '',
+            photoURL: isPeerFrom ? r.fromPhotoURL || '' : r.toPhotoURL || '',
+            status: 'Online',
+          });
+        }
+      });
+
+    return Array.from(byUid.values()).filter((c) => c.uid);
+  }, [contactRequests, userContactsDocs, myProfile, userProfilesMap]);
 
   const getRelationship = useCallback(
     (targetUid) => {
       if (!myProfile || !targetUid) return 'none';
       if (targetUid === myProfile.uid) return 'self';
+
+      if (acceptedContacts.some((c) => c.uid === targetUid)) {
+        return 'accepted';
+      }
+
       const pairId = getPairId(myProfile.uid, targetUid);
-      const req = contactRequests.find((r) => r.id === pairId);
-      if (!req) return 'none';
-      if (req.status === 'accepted') return 'accepted';
-      if (req.status === 'pending') {
-        return req.fromUid === myProfile.uid ? 'outgoing' : 'incoming';
+      const matching = contactRequests.filter((r) => {
+        if (r.id === pairId) return true;
+        const fromUid = r.from || r.fromUid;
+        const toUid = r.to || r.toUid;
+        return (
+          (fromUid === myProfile.uid && toUid === targetUid) ||
+          (fromUid === targetUid && toUid === myProfile.uid)
+        );
+      });
+
+      const acceptedReq = matching.find((r) => r.status === 'accepted');
+      if (acceptedReq) return 'accepted';
+
+      const pendingReq = matching.find((r) => r.status === 'pending');
+      if (pendingReq) {
+        const fromUid = pendingReq.from || pendingReq.fromUid;
+        return fromUid === myProfile.uid ? 'outgoing' : 'incoming';
       }
       return 'none';
     },
-    [myProfile, contactRequests]
+    [myProfile, contactRequests, acceptedContacts]
   );
 
   // ---------------------------------------------------------------------------
@@ -540,24 +801,17 @@ export default function App() {
     setAuthLoading(true);
     setAuthError('');
     try {
-      await signInWithPopup(auth, googleProvider);
+      const cred = await signInWithPopup(auth, googleProvider);
+      if (cred?.user) {
+        syncedLoginUidRef.current = cred.user.uid;
+        await syncUserProfileOnLogin(cred.user);
+      }
     } catch (err) {
       const code = err?.code || '';
-      const isMobile = /Android|iPhone|iPad|iPod/i.test(navigator.userAgent);
-      if (
-        isMobile ||
-        code === 'auth/popup-blocked' ||
-        code === 'auth/operation-not-supported-in-this-browser' ||
-        code === 'auth/cancelled-popup-request'
-      ) {
-        try {
-          await signInWithRedirect(auth, googleProvider);
-          return;
-        } catch (redirectErr) {
-          setAuthError(redirectErr?.message || 'Google sign-in redirect failed.');
-        }
-      } else if (code !== 'auth/popup-closed-by-user') {
-        setAuthError(err?.message || 'Google sign-in failed.');
+      if (code !== 'auth/popup-closed-by-user') {
+        const msg = formatFirestoreError(err, 'Google sign-in failed.');
+        setAuthError(msg);
+        showAppError('Google Sign-In failed', err);
       }
     } finally {
       setAuthLoading(false);
@@ -584,6 +838,9 @@ export default function App() {
           uid: 'demo_me',
           usernameLower: cleanUsername,
           nickname: cleanNickname,
+          displayName: cleanNickname,
+          email: 'alex@example.com',
+          role: 'user',
           photoURL: '',
           status: 'Online',
           statusNote: '',
@@ -598,6 +855,9 @@ export default function App() {
 
       if (!db || !authUser) return;
 
+      const normalizedEmail = (authUser.email || '').trim().toLowerCase();
+      const displayName = authUser.displayName || cleanNickname;
+
       await runTransaction(db, async (tx) => {
         const unameRef = doc(db, 'usernames', cleanUsername);
         const unameSnap = await tx.get(unameRef);
@@ -607,7 +867,7 @@ export default function App() {
 
         const userRef = doc(db, 'users', authUser.uid);
         const userSnap = await tx.get(userRef);
-        if (userSnap.exists()) {
+        if (userSnap.exists() && userSnap.data()?.usernameLower) {
           throw new Error('Account profile already exists.');
         }
 
@@ -621,39 +881,68 @@ export default function App() {
           createdAt: nowTs,
         });
 
-        tx.set(userRef, {
-          uid: authUser.uid,
-          usernameLower: cleanUsername,
-          nickname: cleanNickname,
-          photoURL: authUser.photoURL || '',
-          status: 'Online',
-          statusNote: '',
-          statusExpiresAt: null,
-          isBanned: false,
-          badge: '',
-          createdAt: nowTs,
-          updatedAt: nowTs,
-        });
+        if (userSnap.exists()) {
+          // Preserve existing role / isAdmin while finishing @username setup
+          tx.set(
+            userRef,
+            {
+              uid: authUser.uid,
+              email: normalizedEmail,
+              displayName,
+              usernameLower: cleanUsername,
+              nickname: cleanNickname,
+              photoURL: authUser.photoURL || '',
+              status: 'Online',
+              statusNote: '',
+              statusExpiresAt: null,
+              updatedAt: nowTs,
+            },
+            { merge: true }
+          );
+        } else {
+          tx.set(userRef, {
+            uid: authUser.uid,
+            email: normalizedEmail,
+            displayName,
+            usernameLower: cleanUsername,
+            nickname: cleanNickname,
+            photoURL: authUser.photoURL || '',
+            role: 'user',
+            status: 'Online',
+            statusNote: '',
+            statusExpiresAt: null,
+            isBanned: false,
+            badge: '',
+            createdAt: nowTs,
+            updatedAt: nowTs,
+          });
+        }
       });
     } catch (err) {
-      setOnboardError(err?.message || 'Unable to claim @username.');
+      const msg = formatFirestoreError(err, 'Unable to claim @username.');
+      setOnboardError(msg);
+      showAppError('Onboarding failed', err);
     } finally {
       setAuthLoading(false);
     }
   };
 
   const handleSignOut = async () => {
-    if (demoMode) {
-      setDemoMode(false);
-      setMyProfile(null);
-      setAuthUser(null);
-      setActiveChat(null);
-      setProfileOpen(false);
-      return;
-    }
-    if (auth) {
-      await signOut(auth);
-      setProfileOpen(false);
+    try {
+      if (demoMode) {
+        setDemoMode(false);
+        setMyProfile(null);
+        setAuthUser(null);
+        setActiveChat(null);
+        setProfileOpen(false);
+        return;
+      }
+      if (auth) {
+        await signOut(auth);
+        setProfileOpen(false);
+      }
+    } catch (err) {
+      showAppError('Sign-out failed', err);
     }
   };
 
@@ -667,38 +956,50 @@ export default function App() {
       nickname: sanitizePlainText(updates.nickname, MAX_NICKNAME_LENGTH, false) || myProfile.nickname,
       statusNote: sanitizePlainText(updates.statusNote, MAX_BIO_LENGTH, false),
     };
-    if (demoMode) {
-      const updated = { ...myProfile, ...cleanUpdates };
-      setMyProfile(updated);
-      setUserProfilesMap((prev) => ({ ...prev, [myProfile.uid]: updated }));
-      return;
-    }
+    try {
+      if (demoMode) {
+        const updated = { ...myProfile, ...cleanUpdates };
+        setMyProfile(updated);
+        setUserProfilesMap((prev) => ({ ...prev, [myProfile.uid]: updated }));
+        return;
+      }
 
-    await updateDoc(doc(db, 'users', myProfile.uid), {
-      ...cleanUpdates,
-      updatedAt: serverTimestamp(),
-    });
-    await updateDoc(doc(db, 'usernames', myProfile.usernameLower), {
-      nickname: cleanUpdates.nickname,
-      status: cleanUpdates.status,
-    });
+      await updateDoc(doc(db, 'users', myProfile.uid), {
+        ...cleanUpdates,
+        updatedAt: serverTimestamp(),
+      });
+      if (myProfile.usernameLower) {
+        await setDoc(
+          doc(db, 'usernames', myProfile.usernameLower),
+          {
+            uid: myProfile.uid,
+            usernameLower: myProfile.usernameLower,
+            nickname: cleanUpdates.nickname,
+            status: cleanUpdates.status || 'Online',
+          },
+          { merge: true }
+        );
+      }
+    } catch (err) {
+      showAppError('Profile update failed', err);
+      throw err;
+    }
   };
 
-  const handleFetchOwnerCounts = async () => {
-    if (demoMode) {
-      return {
-        users: Object.keys(userProfilesMap).length,
-        groups: groups.length,
-      };
+  const appendAdminLog = async (action, targetUid = '', details = '') => {
+    if (demoMode || !db || !myProfile?.uid) return;
+    try {
+      await addDoc(collection(db, 'adminLogs'), {
+        actorUid: myProfile.uid,
+        actorEmail: (myProfile.email || authUser?.email || '').trim().toLowerCase(),
+        action: String(action || ''),
+        targetUid: String(targetUid || ''),
+        details: String(details || ''),
+        createdAt: serverTimestamp(),
+      });
+    } catch (err) {
+      setOwnerError((prev) => prev || `Audit log write failed: ${formatFirestoreError(err)}`);
     }
-    const [uSnap, gSnap] = await Promise.all([
-      getCountFromServer(collection(db, 'users')),
-      getCountFromServer(collection(db, 'groups')),
-    ]);
-    return {
-      users: uSnap.data().count,
-      groups: gSnap.data().count,
-    };
   };
 
   const loadOwnerConsoleData = async () => {
@@ -721,10 +1022,12 @@ export default function App() {
         return;
       }
 
-      const [uRes, gRes, dirRes] = await Promise.allSettled([
+      const [uRes, gRes, dirRes, logsRes, reportsRes] = await Promise.allSettled([
         getCountFromServer(collection(db, 'users')),
         getCountFromServer(collection(db, 'groups')),
-        getDocs(query(collection(db, 'users'), orderBy('usernameLower'), limit(25))),
+        getDocs(query(collection(db, 'users'), limit(25))),
+        getDocs(query(collection(db, 'adminLogs'), limit(25))),
+        getDocs(query(collection(db, 'reports'), limit(25))),
       ]);
 
       setOwnerStats({
@@ -738,7 +1041,11 @@ export default function App() {
 
       if (dirRes.status === 'fulfilled') {
         const snap = dirRes.value;
-        const usersList = snap.docs.map((d) => ({ uid: d.id, ...d.data() }));
+        const usersList = snap.docs
+          .map((d) => ({ uid: d.id, ...d.data() }))
+          .sort((a, b) =>
+            (a.usernameLower || a.email || a.uid).localeCompare(b.usernameLower || b.email || b.uid)
+          );
         setOwnerDirectory(usersList);
         setOwnerLastDoc(snap.docs[snap.docs.length - 1] || null);
         setOwnerHasMore(snap.docs.length === 25);
@@ -749,6 +1056,24 @@ export default function App() {
         setBadgeDrafts(drafts);
       } else {
         errors.push(`Directory: ${formatFirestoreError(dirRes.reason)}`);
+      }
+
+      if (logsRes.status === 'fulfilled') {
+        const logsList = logsRes.value.docs
+          .map((d) => ({ id: d.id, ...d.data() }))
+          .sort((a, b) => getMillis(b.createdAt) - getMillis(a.createdAt));
+        setOwnerLogs(logsList);
+      } else {
+        errors.push(`Audit logs: ${formatFirestoreError(logsRes.reason)}`);
+      }
+
+      if (reportsRes.status === 'fulfilled') {
+        const reportsList = reportsRes.value.docs
+          .map((d) => ({ id: d.id, ...d.data() }))
+          .sort((a, b) => getMillis(b.createdAt) - getMillis(a.createdAt));
+        setOwnerReports(reportsList);
+      } else {
+        errors.push(`Reports: ${formatFirestoreError(reportsRes.reason)}`);
       }
 
       if (errors.length > 0) {
@@ -768,7 +1093,6 @@ export default function App() {
     try {
       const nextQuery = query(
         collection(db, 'users'),
-        orderBy('usernameLower'),
         startAfter(ownerLastDoc),
         limit(25)
       );
@@ -809,7 +1133,7 @@ export default function App() {
     setOwnerNotice('');
     const nextAnnouncement = {
       active: Boolean(announcementActiveDraft),
-      text: announcementTextDraft.trim().slice(0, 180),
+      text: (announcementTextDraft || '').trim().slice(0, 180),
       updatedBy: myProfile?.uid || authUser?.uid || '',
     };
     try {
@@ -827,6 +1151,11 @@ export default function App() {
         },
         { merge: true }
       );
+      await appendAdminLog(
+        'announcement_update',
+        'config/appState',
+        `${nextAnnouncement.active ? 'Published' : 'Hidden'}: ${nextAnnouncement.text}`
+      );
       setOwnerNotice('Saved Global Announcement to config/appState.');
     } catch (err) {
       setOwnerError(`Save announcement failed: ${formatFirestoreError(err)}`);
@@ -841,7 +1170,7 @@ export default function App() {
     setOwnerNotice('');
     try {
       if (demoMode) {
-        setAppState((prev) => ({ ...prev, [key]: nextValue }));
+        setAppState((prev) => ({ ...prev, [key]: Boolean(nextValue) }));
         setOwnerNotice(`Updated ${key} in config/appState (preview).`);
         return;
       }
@@ -849,11 +1178,12 @@ export default function App() {
       await setDoc(
         doc(db, 'config', 'appState'),
         {
-          [key]: nextValue,
+          [key]: Boolean(nextValue),
           updatedAt: serverTimestamp(),
         },
         { merge: true }
       );
+      await appendAdminLog('feature_toggle', 'config/appState', `${key}=${Boolean(nextValue)}`);
       setOwnerNotice(`Updated ${key} (${nextValue ? 'enabled' : 'disabled'}) in config/appState.`);
     } catch (err) {
       setOwnerError(`Feature toggle (${key}) failed: ${formatFirestoreError(err)}`);
@@ -885,6 +1215,7 @@ export default function App() {
         badge: cleanBadge,
         updatedAt: serverTimestamp(),
       });
+      await appendAdminLog('badge_update', targetUid, `badge="${cleanBadge}"`);
       setOwnerDirectory((prev) =>
         prev.map((u) => (u.uid === targetUid ? { ...u, badge: cleanBadge } : u))
       );
@@ -896,10 +1227,51 @@ export default function App() {
     }
   };
 
+  const handleUpdateUserRole = async (targetUser, nextRole) => {
+    if (!isOwnerAdmin || !targetUser?.uid) return;
+    if (targetUser.uid === myProfile?.uid && nextRole !== 'admin') {
+      setOwnerError('You cannot remove admin role from your own active session.');
+      return;
+    }
+    const cleanRole = nextRole === 'admin' ? 'admin' : 'user';
+    const nextIsAdmin = cleanRole === 'admin';
+    setOwnerActionUid(targetUser.uid);
+    setOwnerError('');
+    setOwnerNotice('');
+    try {
+      if (demoMode) {
+        setOwnerDirectory((prev) =>
+          prev.map((u) =>
+            u.uid === targetUser.uid ? { ...u, role: cleanRole, isAdmin: nextIsAdmin } : u
+          )
+        );
+        setOwnerNotice(`Updated role=${cleanRole} on users/${targetUser.uid} (preview).`);
+        return;
+      }
+      if (!db) throw new Error('Firestore is not initialized.');
+      await updateDoc(doc(db, 'users', targetUser.uid), {
+        role: cleanRole,
+        isAdmin: nextIsAdmin,
+        updatedAt: serverTimestamp(),
+      });
+      await appendAdminLog('role_update', targetUser.uid, `role=${cleanRole}`);
+      setOwnerDirectory((prev) =>
+        prev.map((u) =>
+          u.uid === targetUser.uid ? { ...u, role: cleanRole, isAdmin: nextIsAdmin } : u
+        )
+      );
+      setOwnerNotice(`Updated role to ${cleanRole} on users/${targetUser.uid}.`);
+    } catch (err) {
+      setOwnerError(`Role update failed (users/${targetUser.uid}): ${formatFirestoreError(err)}`);
+    } finally {
+      setOwnerActionUid('');
+    }
+  };
+
   const handleToggleBan = async (targetUser) => {
     if (!isOwnerAdmin || !targetUser?.uid) return;
     if (targetUser.uid === myProfile?.uid) {
-      setOwnerError('You cannot ban your own active owner account.');
+      setOwnerError('You cannot ban your own active admin account.');
       return;
     }
     const nextBanned = !Boolean(targetUser.isBanned);
@@ -924,6 +1296,7 @@ export default function App() {
         isBanned: nextBanned,
         updatedAt: serverTimestamp(),
       });
+      await appendAdminLog('ban_toggle', targetUser.uid, `isBanned=${nextBanned}`);
       setOwnerDirectory((prev) =>
         prev.map((u) => (u.uid === targetUser.uid ? { ...u, isBanned: nextBanned } : u))
       );
@@ -937,120 +1310,288 @@ export default function App() {
     }
   };
 
+  const handleResolveReport = async (reportId, nextStatus) => {
+    if (!isOwnerAdmin || !reportId) return;
+    const cleanStatus = nextStatus === 'dismissed' ? 'dismissed' : 'resolved';
+    setOwnerError('');
+    setOwnerNotice('');
+    try {
+      if (!db) throw new Error('Firestore is not initialized.');
+      await updateDoc(doc(db, 'reports', reportId), {
+        status: cleanStatus,
+        reviewedBy: myProfile?.uid || '',
+        updatedAt: serverTimestamp(),
+      });
+      await appendAdminLog('report_update', reportId, `status=${cleanStatus}`);
+      setOwnerReports((prev) =>
+        prev.map((r) => (r.id === reportId ? { ...r, status: cleanStatus } : r))
+      );
+      setOwnerNotice(`Marked report ${reportId} as ${cleanStatus}.`);
+    } catch (err) {
+      setOwnerError(`Report update failed: ${formatFirestoreError(err)}`);
+    }
+  };
+
   // ---------------------------------------------------------------------------
   // Handlers: Search & Contact Requests
   // ---------------------------------------------------------------------------
   const handleSearch = async (e) => {
     e.preventDefault();
-    const clean = normalizeHandle(searchInput);
-    if (!clean) {
+    const trimmed = searchInput.trim();
+    setContactStatusMessage('');
+    if (!trimmed) {
       setSearchResult(null);
       setSearchError('');
       return;
     }
-    if (!isValidUsername(clean)) {
-      setSearchResult(null);
-      setSearchError('Enter a valid 3–12 character @username (letters, numbers, underscores).');
-      return;
-    }
+
+    const isEmailQuery = trimmed.includes('@') && !trimmed.startsWith('@');
     setSearching(true);
     setSearchError('');
     try {
-      const found = await lookupUserByHandle(clean);
+      let found = null;
+      if (isEmailQuery) {
+        const normalizedEmail = trimmed.toLowerCase();
+        found = await lookupUserByEmail(normalizedEmail);
+      } else {
+        const clean = normalizeHandle(trimmed);
+        if (!isValidUsername(clean)) {
+          setSearchResult(null);
+          setSearchError('Enter a valid email address or 3–12 character @username.');
+          setSearching(false);
+          return;
+        }
+        found = await lookupUserByHandle(clean);
+      }
+
       if (!found) {
         setSearchResult(null);
-        setSearchError(`No Voliud user found for @${clean}`);
+        setSearchError('User not found');
       } else {
         setSearchResult(found);
       }
     } catch (err) {
-      setSearchError(err?.message || 'Search failed.');
+      setSearchResult(null);
+      const msg = formatFirestoreError(err, 'Search failed.');
+      setSearchError(msg);
+      showAppError('User search failed', err);
     } finally {
       setSearching(false);
     }
   };
 
   const handleAddContact = async (targetUser) => {
-    if (!myProfile || !targetUser || targetUser.uid === myProfile.uid) return;
+    const currentUid = authUser?.uid || myProfile?.uid;
+    if (!currentUid || !targetUser?.uid) return;
+
+    if (targetUser.uid === currentUid) {
+      setSearchError('You cannot send a contact request to yourself.');
+      setContactStatusMessage('You cannot send a contact request to yourself.');
+      return;
+    }
+
     const gate = contactRequestLimiterRef.current.check();
     if (!gate.allowed) {
       setSearchError(gate.message);
+      setContactStatusMessage(gate.message);
       return;
     }
-    const pairId = getPairId(myProfile.uid, targetUser.uid);
+
+    const pairId = getPairId(currentUid, targetUser.uid);
     setBusyActionId(pairId);
+    setSearchError('');
+    setContactStatusMessage('');
 
     try {
       if (demoMode) {
+        const existingPending = contactRequests.some(
+          (r) =>
+            r.status === 'pending' &&
+            ((r.from === currentUid && r.to === targetUser.uid) ||
+              (r.from === targetUser.uid && r.to === currentUid) ||
+              r.id === pairId)
+        );
+        if (existingPending) {
+          setContactStatusMessage('Request already pending');
+          return;
+        }
         setContactRequests((prev) => [
-          ...prev.filter((r) => r.id !== pairId),
+          ...prev,
           {
-            id: pairId,
-            participants: [myProfile.uid, targetUser.uid].sort(),
-            fromUid: myProfile.uid,
-            toUid: targetUser.uid,
-            fromUsername: myProfile.usernameLower,
-            fromNickname: myProfile.nickname,
-            fromPhotoURL: myProfile.photoURL || '',
-            toUsername: targetUser.usernameLower,
-            toNickname: targetUser.nickname,
-            toPhotoURL: targetUser.photoURL || '',
+            id: `req_${Date.now()}`,
+            from: currentUid,
+            fromEmail: (myProfile?.email || 'alex@example.com').trim().toLowerCase(),
+            fromName: myProfile?.displayName || myProfile?.nickname || '',
+            to: targetUser.uid,
+            toEmail: (targetUser.email || '').trim().toLowerCase(),
+            toName: targetUser.displayName || targetUser.nickname || '',
             status: 'pending',
             createdAtMs: Date.now(),
           },
         ]);
+        setContactStatusMessage('Contact request sent');
+        showAppStatus('Contact request sent');
         return;
       }
 
-      await setDoc(doc(db, 'contactRequests', pairId), {
-        participants: [myProfile.uid, targetUser.uid].sort(),
-        fromUid: myProfile.uid,
-        toUid: targetUser.uid,
-        fromUsername: myProfile.usernameLower,
-        fromNickname: myProfile.nickname,
-        fromPhotoURL: myProfile.photoURL || '',
-        toUsername: targetUser.usernameLower,
-        toNickname: targetUser.nickname || `@${targetUser.usernameLower}`,
-        toPhotoURL: targetUser.photoURL || '',
+      if (!db) throw new Error('Firestore is not initialized.');
+
+      // Check Firestore for any existing pending request in either direction
+      const [outgoingSnap, incomingSnap] = await Promise.all([
+        getDocs(
+          query(
+            collection(db, 'contactRequests'),
+            where('from', '==', currentUid),
+            where('to', '==', targetUser.uid),
+            where('status', '==', 'pending'),
+            limit(1)
+          )
+        ),
+        getDocs(
+          query(
+            collection(db, 'contactRequests'),
+            where('from', '==', targetUser.uid),
+            where('to', '==', currentUid),
+            where('status', '==', 'pending'),
+            limit(1)
+          )
+        ),
+      ]);
+
+      if (!outgoingSnap.empty || !incomingSnap.empty) {
+        setContactStatusMessage('Request already pending');
+        showAppStatus('Request already pending');
+        return;
+      }
+
+      const fromEmail = (authUser?.email || myProfile?.email || '').trim().toLowerCase();
+      const fromName = authUser?.displayName || myProfile?.displayName || myProfile?.nickname || '';
+      const toEmail = (targetUser.email || '').trim().toLowerCase();
+      const toName = targetUser.displayName || targetUser.nickname || '';
+
+      await addDoc(collection(db, 'contactRequests'), {
+        from: currentUid,
+        fromEmail,
+        fromName,
+        to: targetUser.uid,
+        toEmail,
+        toName,
         status: 'pending',
         createdAt: serverTimestamp(),
-        updatedAt: serverTimestamp(),
       });
+
+      setContactStatusMessage('Contact request sent');
+      showAppStatus('Contact request sent');
+    } catch (err) {
+      const msg = formatFirestoreError(err, 'Failed to send contact request.');
+      setSearchError(msg);
+      setContactStatusMessage(msg);
+      showAppError('Send contact request failed', err);
     } finally {
       setBusyActionId('');
     }
   };
 
   const handleAcceptRequest = async (reqOrUser) => {
-    if (!myProfile) return;
+    const myUid = authUser?.uid || myProfile?.uid;
+    if (!myUid || !reqOrUser) return;
+
     const req =
-      reqOrUser.fromUid && reqOrUser.toUid
+      reqOrUser.from || reqOrUser.fromUid
         ? reqOrUser
-        : contactRequests.find((r) => r.id === getPairId(myProfile.uid, reqOrUser.uid));
+        : contactRequests.find(
+            (r) =>
+              r.status === 'pending' &&
+              ((r.from === reqOrUser.uid && r.to === myUid) ||
+                (r.fromUid === reqOrUser.uid && r.toUid === myUid) ||
+                r.id === getPairId(myUid, reqOrUser.uid))
+          );
     if (!req) return;
 
+    const peerUid =
+      req.from && req.to
+        ? req.from === myUid
+          ? req.to
+          : req.from
+        : (req.participants || []).find((id) => id !== myUid) || req.fromUid;
+    if (!peerUid) return;
+
+    const pairId = getPairId(myUid, peerUid);
     setBusyActionId(req.id);
     try {
       if (demoMode) {
         setContactRequests((prev) =>
           prev.map((r) => (r.id === req.id ? { ...r, status: 'accepted' } : r))
         );
+        setDirectChatsMap((prev) => ({
+          ...prev,
+          [pairId]: prev[pairId] || {
+            id: pairId,
+            participants: [myUid, peerUid].sort(),
+            updatedAtMs: Date.now(),
+          },
+        }));
+        setNotifOpen(false);
+        setSearchResult(null);
+        setInviteModalUser(null);
+        setActiveChat({ type: 'direct', id: pairId, peerUid });
+        showAppStatus('Contact request accepted');
         return;
       }
 
+      if (!db) throw new Error('Firestore is not initialized.');
+
+      // 1. Update request status to "accepted"
       await updateDoc(doc(db, 'contactRequests', req.id), {
         status: 'accepted',
         updatedAt: serverTimestamp(),
       });
 
+      // 2. Add both users to each other's contacts subcollection
+      const peerProfile = userProfilesMap[peerUid] || {};
+      const myEntry = {
+        uid: myUid,
+        email: (authUser?.email || myProfile?.email || '').trim().toLowerCase(),
+        displayName: authUser?.displayName || myProfile?.displayName || myProfile?.nickname || '',
+        usernameLower: myProfile?.usernameLower || '',
+        nickname: myProfile?.nickname || myProfile?.displayName || '',
+        photoURL: myProfile?.photoURL || authUser?.photoURL || '',
+        chatId: pairId,
+        addedAt: serverTimestamp(),
+      };
+      const peerEntry = {
+        uid: peerUid,
+        email: (peerProfile.email || req.fromEmail || '').trim().toLowerCase(),
+        displayName: peerProfile.displayName || req.fromName || '',
+        usernameLower: peerProfile.usernameLower || req.fromUsername || '',
+        nickname: peerProfile.nickname || req.fromName || req.fromNickname || req.fromEmail || '',
+        photoURL: peerProfile.photoURL || req.fromPhotoURL || '',
+        chatId: pairId,
+        addedAt: serverTimestamp(),
+      };
+
+      await Promise.all([
+        setDoc(doc(db, 'users', myUid, 'contacts', peerUid), peerEntry, { merge: true }),
+        setDoc(doc(db, 'users', peerUid, 'contacts', myUid), myEntry, { merge: true }),
+      ]);
+
+      // 3. Create / ensure direct chat document and open it cleanly
       await setDoc(
-        doc(db, 'chats', req.id),
+        doc(db, 'chats', pairId),
         {
-          participants: req.participants,
+          participants: [myUid, peerUid].sort(),
           updatedAt: serverTimestamp(),
         },
         { merge: true }
       );
+
+      setNotifOpen(false);
+      setSearchResult(null);
+      setInviteModalUser(null);
+      setActiveChat({ type: 'direct', id: pairId, peerUid });
+      showAppStatus('Contact request accepted');
+    } catch (err) {
+      showAppError('Accept contact request failed', err);
     } finally {
       setBusyActionId('');
     }
@@ -1067,6 +1608,8 @@ export default function App() {
         status: 'declined',
         updatedAt: serverTimestamp(),
       });
+    } catch (err) {
+      showAppError('Decline contact request failed', err);
     } finally {
       setBusyActionId('');
     }
@@ -1080,6 +1623,8 @@ export default function App() {
         return;
       }
       await deleteDoc(doc(db, 'contactRequests', req.id));
+    } catch (err) {
+      showAppError('Cancel outgoing request failed', err);
     } finally {
       setBusyActionId('');
     }
@@ -1088,20 +1633,25 @@ export default function App() {
   const openDirectChat = async (peerUser) => {
     if (!myProfile || !peerUser) return;
     const chatId = getPairId(myProfile.uid, peerUser.uid);
-    if (!demoMode && isFirebaseConfigured && db && !directChatsMap[chatId]) {
-      await setDoc(
-        doc(db, 'chats', chatId),
-        {
-          participants: [myProfile.uid, peerUser.uid].sort(),
-          updatedAt: serverTimestamp(),
-        },
-        { merge: true }
-      );
+    try {
+      if (!demoMode && isFirebaseConfigured && db && !directChatsMap[chatId]) {
+        await setDoc(
+          doc(db, 'chats', chatId),
+          {
+            participants: [myProfile.uid, peerUser.uid].sort(),
+            updatedAt: serverTimestamp(),
+          },
+          { merge: true }
+        );
+      }
+      setSearchResult(null);
+      setSearchInput('');
+      setContactStatusMessage('');
+      setInviteModalUser(null);
+      setActiveChat({ type: 'direct', id: chatId, peerUid: peerUser.uid });
+    } catch (err) {
+      showAppError('Open direct chat failed', err);
     }
-    setSearchResult(null);
-    setSearchInput('');
-    setInviteModalUser(null);
-    setActiveChat({ type: 'direct', id: chatId, peerUid: peerUser.uid });
   };
 
   // ---------------------------------------------------------------------------
@@ -1126,8 +1676,8 @@ export default function App() {
 
     const baseMsg = {
       senderUid: myProfile.uid,
-      senderUsername: myProfile.usernameLower,
-      senderNickname: myProfile.nickname,
+      senderUsername: myProfile.usernameLower || '',
+      senderNickname: myProfile.nickname || myProfile.displayName || '',
       createdAtMs: Date.now(),
       ...sanitizedPayload,
     };
@@ -1166,20 +1716,25 @@ export default function App() {
       return true;
     }
 
-    const colName = activeChat.type === 'group' ? 'groups' : 'chats';
-    await addDoc(collection(db, colName, activeChat.id, 'messages'), {
-      ...baseMsg,
-      createdAt: serverTimestamp(),
-    });
-    await setDoc(
-      doc(db, colName, activeChat.id),
-      {
-        lastMessage: previewText.slice(0, 140),
-        updatedAt: serverTimestamp(),
-      },
-      { merge: true }
-    );
-    return true;
+    try {
+      const colName = activeChat.type === 'group' ? 'groups' : 'chats';
+      await addDoc(collection(db, colName, activeChat.id, 'messages'), {
+        ...baseMsg,
+        createdAt: serverTimestamp(),
+      });
+      await setDoc(
+        doc(db, colName, activeChat.id),
+        {
+          lastMessage: previewText.slice(0, 140),
+          updatedAt: serverTimestamp(),
+        },
+        { merge: true }
+      );
+      return true;
+    } catch (err) {
+      showAppError('Send message failed', err);
+      return false;
+    }
   };
 
   const handleSendMessage = async (text, replyTo) => {
@@ -1215,10 +1770,14 @@ export default function App() {
       }));
       return;
     }
-    const colName = activeChat.type === 'group' ? 'groups' : 'chats';
-    await updateDoc(doc(db, colName, activeChat.id, 'messages', messageId), {
-      'call.status': nextStatus,
-    });
+    try {
+      const colName = activeChat.type === 'group' ? 'groups' : 'chats';
+      await updateDoc(doc(db, colName, activeChat.id, 'messages', messageId), {
+        'call.status': nextStatus,
+      });
+    } catch (err) {
+      showAppError('Call status update failed', err);
+    }
   };
 
   const handleSendPoll = async (question, optionTexts) => {
@@ -1270,29 +1829,33 @@ export default function App() {
       return;
     }
 
-    const colName = activeChat.type === 'group' ? 'groups' : 'chats';
-    const msgDocRef = doc(db, colName, activeChat.id, 'messages', messageId);
-    await runTransaction(db, async (tx) => {
-      const snap = await tx.get(msgDocRef);
-      if (!snap.exists()) return;
-      const data = snap.data();
-      const poll = data.poll;
-      if (!poll?.options) return;
+    try {
+      const colName = activeChat.type === 'group' ? 'groups' : 'chats';
+      const msgDocRef = doc(db, colName, activeChat.id, 'messages', messageId);
+      await runTransaction(db, async (tx) => {
+        const snap = await tx.get(msgDocRef);
+        if (!snap.exists()) return;
+        const data = snap.data();
+        const poll = data.poll;
+        if (!poll?.options) return;
 
-      const alreadySelected = poll.options
-        .find((o) => o.id === optionId)
-        ?.votes?.includes(myUid);
+        const alreadySelected = poll.options
+          .find((o) => o.id === optionId)
+          ?.votes?.includes(myUid);
 
-      const nextOptions = poll.options.map((o) => {
-        const cleaned = (o.votes || []).filter((u) => u !== myUid);
-        if (o.id === optionId && !alreadySelected) {
-          return { ...o, votes: [...cleaned, myUid] };
-        }
-        return { ...o, votes: cleaned };
+        const nextOptions = poll.options.map((o) => {
+          const cleaned = (o.votes || []).filter((u) => u !== myUid);
+          if (o.id === optionId && !alreadySelected) {
+            return { ...o, votes: [...cleaned, myUid] };
+          }
+          return { ...o, votes: cleaned };
+        });
+
+        tx.update(msgDocRef, { 'poll.options': nextOptions });
       });
-
-      tx.update(msgDocRef, { 'poll.options': nextOptions });
-    });
+    } catch (err) {
+      showAppError('Poll vote failed', err);
+    }
   };
 
   const handleTypingChange = useCallback(
@@ -1357,12 +1920,17 @@ export default function App() {
       return;
     }
 
-    const docRef = await addDoc(collection(db, 'groups'), {
-      ...newGroup,
-      createdAt: serverTimestamp(),
-      updatedAt: serverTimestamp(),
-    });
-    setActiveChat({ type: 'group', id: docRef.id });
+    try {
+      const docRef = await addDoc(collection(db, 'groups'), {
+        ...newGroup,
+        createdAt: serverTimestamp(),
+        updatedAt: serverTimestamp(),
+      });
+      setActiveChat({ type: 'group', id: docRef.id });
+    } catch (err) {
+      showAppError('Create group failed', err);
+      throw err;
+    }
   };
 
   const handleUpdateGroupName = async (groupId, nextName) => {
@@ -1372,10 +1940,14 @@ export default function App() {
       setGroups((prev) => prev.map((g) => (g.id === groupId ? { ...g, name: cleanName } : g)));
       return;
     }
-    await updateDoc(doc(db, 'groups', groupId), {
-      name: cleanName,
-      updatedAt: serverTimestamp(),
-    });
+    try {
+      await updateDoc(doc(db, 'groups', groupId), {
+        name: cleanName,
+        updatedAt: serverTimestamp(),
+      });
+    } catch (err) {
+      showAppError('Update group name failed', err);
+    }
   };
 
   const handleTogglePermission = async (groupId, key, value) => {
@@ -1387,10 +1959,14 @@ export default function App() {
       );
       return;
     }
-    await updateDoc(doc(db, 'groups', groupId), {
-      [`permissions.${key}`]: value,
-      updatedAt: serverTimestamp(),
-    });
+    try {
+      await updateDoc(doc(db, 'groups', groupId), {
+        [`permissions.${key}`]: value,
+        updatedAt: serverTimestamp(),
+      });
+    } catch (err) {
+      showAppError('Update group permissions failed', err);
+    }
   };
 
   const handleAddGroupMember = async (groupId, newUid) => {
@@ -1403,10 +1979,14 @@ export default function App() {
       );
       return;
     }
-    await updateDoc(doc(db, 'groups', groupId), {
-      members: nextMembers,
-      updatedAt: serverTimestamp(),
-    });
+    try {
+      await updateDoc(doc(db, 'groups', groupId), {
+        members: nextMembers,
+        updatedAt: serverTimestamp(),
+      });
+    } catch (err) {
+      showAppError('Add group member failed', err);
+    }
   };
 
   const handlePromoteAdmin = async (groupId, targetUid) => {
@@ -1419,10 +1999,14 @@ export default function App() {
       );
       return;
     }
-    await updateDoc(doc(db, 'groups', groupId), {
-      admins: nextAdmins,
-      updatedAt: serverTimestamp(),
-    });
+    try {
+      await updateDoc(doc(db, 'groups', groupId), {
+        admins: nextAdmins,
+        updatedAt: serverTimestamp(),
+      });
+    } catch (err) {
+      showAppError('Promote group admin failed', err);
+    }
   };
 
   const handleExitGroup = async (group) => {
@@ -1436,8 +2020,12 @@ export default function App() {
         setActiveChat(null);
         return;
       }
-      await deleteDoc(doc(db, 'groups', group.id));
-      setActiveChat(null);
+      try {
+        await deleteDoc(doc(db, 'groups', group.id));
+        setActiveChat(null);
+      } catch (err) {
+        showAppError('Delete group failed', err);
+      }
       return;
     }
 
@@ -1451,12 +2039,16 @@ export default function App() {
       return;
     }
 
-    await updateDoc(doc(db, 'groups', group.id), {
-      members: remainingMembers,
-      admins: remainingAdmins,
-      updatedAt: serverTimestamp(),
-    });
-    setActiveChat(null);
+    try {
+      await updateDoc(doc(db, 'groups', group.id), {
+        members: remainingMembers,
+        admins: remainingAdmins,
+        updatedAt: serverTimestamp(),
+      });
+      setActiveChat(null);
+    } catch (err) {
+      showAppError('Exit group failed', err);
+    }
   };
 
   const handleUpdateFamilyData = async (groupId, patch) => {
@@ -1464,10 +2056,14 @@ export default function App() {
       setGroups((prev) => prev.map((g) => (g.id === groupId ? { ...g, ...patch } : g)));
       return;
     }
-    await updateDoc(doc(db, 'groups', groupId), {
-      ...patch,
-      updatedAt: serverTimestamp(),
-    });
+    try {
+      await updateDoc(doc(db, 'groups', groupId), {
+        ...patch,
+        updatedAt: serverTimestamp(),
+      });
+    } catch (err) {
+      showAppError('Update family panel failed', err);
+    }
   };
 
   // ---------------------------------------------------------------------------
@@ -1690,10 +2286,10 @@ export default function App() {
       );
     }
 
-    if (!myProfile) {
+    if (!myProfile || !myProfile.usernameLower) {
       return (
         <OnboardingCard
-          initialNickname={authUser?.displayName || ''}
+          initialNickname={authUser?.displayName || myProfile?.displayName || ''}
           allowNewSignups={appState.allowNewSignups}
           onComplete={handleCompleteOnboarding}
           loading={authLoading}
@@ -1800,7 +2396,7 @@ export default function App() {
             </div>
           </div>
 
-          {/* @username Search Bar */}
+          {/* Email or @username Search Bar */}
           <form onSubmit={handleSearch} className="mt-3.5 relative">
             <div className="flex items-center rounded-2xl border border-white/16 bg-[#121212] px-3.5 py-2.5 focus-within:border-white transition">
               <Search className="mr-2.5 h-4 w-4 shrink-0 text-white/45" />
@@ -1809,12 +2405,13 @@ export default function App() {
                 value={searchInput}
                 onChange={(e) => {
                   setSearchInput(e.target.value);
+                  setContactStatusMessage('');
                   if (!e.target.value.trim()) {
                     setSearchResult(null);
                     setSearchError('');
                   }
                 }}
-                placeholder="Search exact @username (max 12)..."
+                placeholder="Search Gmail address or @username..."
                 autoCapitalize="none"
                 autoCorrect="off"
                 spellCheck={false}
@@ -1827,6 +2424,7 @@ export default function App() {
                     setSearchInput('');
                     setSearchResult(null);
                     setSearchError('');
+                    setContactStatusMessage('');
                   }}
                   className="mr-1.5 text-white/40 hover:text-white"
                 >
@@ -1845,7 +2443,7 @@ export default function App() {
 
           {/* Inline Floating 3D Profile Preview Card directly beneath search input */}
           {searchError && (
-            <div className="mt-3 rounded-2xl border border-white/16 bg-[#121212] px-4 py-3 text-xs text-white/70">
+            <div className="mt-3 rounded-2xl border border-white/16 bg-[#121212] px-4 py-3 text-xs text-white/80">
               {searchError}
             </div>
           )}
@@ -1856,10 +2454,14 @@ export default function App() {
                 user={searchResult}
                 relationship={getRelationship(searchResult.uid)}
                 loading={busyActionId === getPairId(myProfile.uid, searchResult.uid)}
+                statusMessage={contactStatusMessage}
                 onAddContact={handleAddContact}
                 onAcceptRequest={handleAcceptRequest}
                 onOpenChat={openDirectChat}
-                onClose={() => setSearchResult(null)}
+                onClose={() => {
+                  setSearchResult(null);
+                  setContactStatusMessage('');
+                }}
               />
             </div>
           )}
@@ -1966,7 +2568,7 @@ export default function App() {
                     <div className="flex items-center gap-3 min-w-0">
                       <AvatarRing3D
                         src={contact.photoURL}
-                        name={contact.nickname || contact.usernameLower}
+                        name={contact.nickname || contact.displayName || contact.usernameLower || contact.email}
                         status={contact.status || 'Online'}
                         size={42}
                         animated={false}
@@ -1974,7 +2576,7 @@ export default function App() {
                       <div className="min-w-0">
                         <div className="flex items-center gap-1.5">
                           <span className="truncate text-sm font-semibold text-white">
-                            {contact.nickname || `@${contact.usernameLower}`}
+                            {contact.nickname || contact.displayName || (contact.usernameLower ? `@${contact.usernameLower}` : contact.email)}
                           </span>
                           {contact.badge && (
                             <span className="shrink-0 rounded-full border border-white/25 bg-white/10 px-1.5 py-0.5 font-mono text-[8.5px] font-semibold uppercase tracking-wider text-white">
@@ -1982,7 +2584,7 @@ export default function App() {
                             </span>
                           )}
                           <span className="truncate font-mono text-[11px] text-white/40">
-                            @{contact.usernameLower}
+                            {contact.usernameLower ? `@${contact.usernameLower}` : contact.email || ''}
                           </span>
                         </div>
                         <p className="mt-0.5 truncate text-xs text-white/55">
@@ -2044,6 +2646,8 @@ export default function App() {
     return (
       (u.usernameLower || '').toLowerCase().includes(q) ||
       (u.nickname || '').toLowerCase().includes(q) ||
+      (u.displayName || '').toLowerCase().includes(q) ||
+      (u.email || '').toLowerCase().includes(q) ||
       (u.uid || '').toLowerCase().includes(q)
     );
   });
@@ -2051,6 +2655,45 @@ export default function App() {
   return (
     <div className="min-h-[100dvh] w-full bg-black flex justify-center">
       <div className="relative flex h-[100dvh] w-full max-w-[480px] flex-col overflow-hidden bg-black sm:border-x sm:border-white/14 sm:shadow-[0_0_90px_rgba(255,255,255,0.05)]">
+        {/* Visible Global Firebase / Action Error Alert */}
+        {appError && (
+          <div
+            role="alert"
+            className="shrink-0 flex items-start justify-between gap-2.5 border-b border-white/30 bg-[#181818] px-3.5 py-2.5 text-white z-40"
+          >
+            <div className="flex items-start gap-2 min-w-0">
+              <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0 text-white" />
+              <p className="font-mono text-[11px] leading-snug break-words">{appError}</p>
+            </div>
+            <button
+              type="button"
+              onClick={() => setAppError('')}
+              className="flex h-6 w-6 shrink-0 items-center justify-center rounded-full border border-white/20 bg-black text-white/75 hover:text-white transition"
+              aria-label="Dismiss error alert"
+            >
+              <X className="h-3.5 w-3.5" />
+            </button>
+          </div>
+        )}
+
+        {/* Visible Status Toast */}
+        {appStatus && !appError && (
+          <div className="shrink-0 flex items-center justify-between gap-2.5 border-b border-white/25 bg-[#121212] px-3.5 py-2 text-white z-40">
+            <div className="flex items-center gap-2 min-w-0">
+              <Check className="h-3.5 w-3.5 shrink-0 text-white" />
+              <p className="text-xs font-medium truncate">{appStatus}</p>
+            </div>
+            <button
+              type="button"
+              onClick={() => setAppStatus('')}
+              className="flex h-5 w-5 shrink-0 items-center justify-center rounded-full text-white/60 hover:text-white"
+              aria-label="Dismiss status"
+            >
+              <X className="h-3 w-3" />
+            </button>
+          </div>
+        )}
+
         {/* Live Dismissible Global Announcement Banner (config/appState) */}
         {showGlobalBanner && (
           <div className="shrink-0 flex items-center justify-between gap-2.5 border-b border-white/25 bg-white px-3.5 py-2 text-black shadow-spatial-white z-30">
@@ -2082,10 +2725,14 @@ export default function App() {
             user={inviteModalUser}
             relationship={getRelationship(inviteModalUser.uid)}
             loading={busyActionId === getPairId(myProfile.uid, inviteModalUser.uid)}
+            statusMessage={contactStatusMessage}
             onAddContact={handleAddContact}
             onAcceptRequest={handleAcceptRequest}
             onOpenChat={openDirectChat}
-            onClose={() => setInviteModalUser(null)}
+            onClose={() => {
+              setInviteModalUser(null);
+              setContactStatusMessage('');
+            }}
           />
         )}
 
@@ -2355,6 +3002,7 @@ export default function App() {
                       const isSelf = u.uid === myProfile?.uid;
                       const isBusy = ownerActionUid === u.uid;
                       const draftVal = badgeDrafts[u.uid] ?? u.badge ?? '';
+                      const isTargetAdmin = u.role === 'admin' || u.isAdmin === true;
 
                       return (
                         <div
@@ -2365,10 +3013,15 @@ export default function App() {
                             <div className="min-w-0">
                               <div className="flex items-center gap-1.5 flex-wrap">
                                 <span className="text-xs font-semibold text-white">
-                                  {u.nickname || `@${u.usernameLower}`}
+                                  {u.nickname || u.displayName || (u.usernameLower ? `@${u.usernameLower}` : u.email || 'User')}
                                 </span>
-                                <span className="font-mono text-[11px] text-white/55">
-                                  @{u.usernameLower}
+                                {u.usernameLower && (
+                                  <span className="font-mono text-[11px] text-white/55">
+                                    @{u.usernameLower}
+                                  </span>
+                                )}
+                                <span className="rounded-full border border-white/25 bg-black px-2 py-0.5 font-mono text-[9px] font-semibold uppercase tracking-wider text-white/80">
+                                  {isTargetAdmin ? 'ADMIN' : 'USER'}
                                 </span>
                                 {u.badge && (
                                   <span className="rounded-full border border-white/30 bg-white/10 px-2 py-0.5 font-mono text-[9px] font-semibold uppercase tracking-wider text-white">
@@ -2381,25 +3034,49 @@ export default function App() {
                                   </span>
                                 )}
                               </div>
-                              <div className="mt-0.5 truncate font-mono text-[10px] text-white/40">
+                              {u.email && (
+                                <div className="mt-0.5 truncate font-mono text-[10px] text-white/50">
+                                  {u.email}
+                                </div>
+                              )}
+                              <div className="mt-0.5 truncate font-mono text-[10px] text-white/35">
                                 UID: {u.uid}
                               </div>
                             </div>
 
-                            <button
-                              type="button"
-                              disabled={isSelf || isBusy}
-                              onClick={() => handleToggleBan(u)}
-                              className={`flex shrink-0 items-center gap-1 rounded-lg border px-2.5 py-1.5 text-[10.5px] font-semibold transition disabled:opacity-35 ${
-                                u.isBanned
-                                  ? 'border-white bg-white text-black'
-                                  : 'border-white/25 bg-black text-white hover:bg-white hover:text-black'
-                              }`}
-                              title={isSelf ? 'Cannot ban yourself' : u.isBanned ? 'Unban user' : 'Ban user'}
-                            >
-                              <Ban className="h-3 w-3" />
-                              <span>{u.isBanned ? 'Unban' : 'Ban'}</span>
-                            </button>
+                            <div className="flex shrink-0 items-center gap-1.5">
+                              <button
+                                type="button"
+                                disabled={(isSelf && isTargetAdmin) || isBusy}
+                                onClick={() =>
+                                  handleUpdateUserRole(u, isTargetAdmin ? 'user' : 'admin')
+                                }
+                                className={`flex items-center gap-1 rounded-lg border px-2.5 py-1.5 text-[10.5px] font-semibold transition disabled:opacity-35 ${
+                                  isTargetAdmin
+                                    ? 'border-white bg-white text-black'
+                                    : 'border-white/25 bg-black text-white hover:bg-white hover:text-black'
+                                }`}
+                                title={isTargetAdmin ? 'Demote to user' : 'Promote to admin'}
+                              >
+                                <UserCheck className="h-3 w-3" />
+                                <span>{isTargetAdmin ? 'Admin' : 'Promote'}</span>
+                              </button>
+
+                              <button
+                                type="button"
+                                disabled={isSelf || isBusy}
+                                onClick={() => handleToggleBan(u)}
+                                className={`flex items-center gap-1 rounded-lg border px-2.5 py-1.5 text-[10.5px] font-semibold transition disabled:opacity-35 ${
+                                  u.isBanned
+                                    ? 'border-white bg-white text-black'
+                                    : 'border-white/25 bg-black text-white hover:bg-white hover:text-black'
+                                }`}
+                                title={isSelf ? 'Cannot ban yourself' : u.isBanned ? 'Unban user' : 'Ban user'}
+                              >
+                                <Ban className="h-3 w-3" />
+                                <span>{u.isBanned ? 'Unban' : 'Ban'}</span>
+                              </button>
+                            </div>
                           </div>
 
                           {/* Custom Badge Editor */}
@@ -2462,6 +3139,98 @@ export default function App() {
                     {ownerLoading ? 'Loading...' : 'Load Next 25 Users'}
                   </button>
                 )}
+              </div>
+
+              {/* 4. Reports & Audit Logs */}
+              <div className="mt-4 rounded-2xl border border-white/16 bg-black p-4 space-y-3">
+                <div className="flex items-center justify-between gap-2">
+                  <div className="flex items-center gap-2">
+                    <FileText className="h-4 w-4 text-white" />
+                    <span className="text-[10px] font-semibold uppercase tracking-[0.18em] text-white/60">
+                      Reports ({ownerReports.length}) &amp; Audit Logs ({ownerLogs.length})
+                    </span>
+                  </div>
+                </div>
+
+                {ownerReports.length > 0 && (
+                  <div className="space-y-2">
+                    <div className="font-mono text-[10px] uppercase tracking-wider text-white/45">
+                      User Reports
+                    </div>
+                    {ownerReports.map((rep) => (
+                      <div
+                        key={rep.id}
+                        className="rounded-xl border border-white/14 bg-[#121212] p-2.5 text-xs space-y-1.5"
+                      >
+                        <div className="flex items-center justify-between gap-2">
+                          <span className="font-semibold text-white truncate">
+                            {rep.reason || 'Report'}
+                          </span>
+                          <span className="rounded-full border border-white/25 bg-black px-2 py-0.5 font-mono text-[9px] uppercase text-white/80">
+                            {rep.status || 'open'}
+                          </span>
+                        </div>
+                        {rep.details && (
+                          <p className="text-[11px] text-white/65 break-words">{rep.details}</p>
+                        )}
+                        <div className="flex items-center justify-between gap-2 pt-1">
+                          <span className="font-mono text-[9.5px] text-white/40 truncate">
+                            By: {rep.reporterUid || 'unknown'}
+                          </span>
+                          {rep.status !== 'resolved' && rep.status !== 'dismissed' && (
+                            <div className="flex items-center gap-1.5">
+                              <button
+                                type="button"
+                                onClick={() => handleResolveReport(rep.id, 'resolved')}
+                                className="rounded-md bg-white px-2 py-1 text-[10px] font-semibold text-black"
+                              >
+                                Resolve
+                              </button>
+                              <button
+                                type="button"
+                                onClick={() => handleResolveReport(rep.id, 'dismissed')}
+                                className="rounded-md border border-white/20 bg-black px-2 py-1 text-[10px] text-white/75"
+                              >
+                                Dismiss
+                              </button>
+                            </div>
+                          )}
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                )}
+
+                <div className="space-y-1.5">
+                  <div className="font-mono text-[10px] uppercase tracking-wider text-white/45">
+                    Recent Admin Audit Logs
+                  </div>
+                  {ownerLogs.length === 0 ? (
+                    <div className="rounded-xl border border-white/10 bg-[#121212] py-3 text-center text-[11px] text-white/40">
+                      No audit logs recorded yet.
+                    </div>
+                  ) : (
+                    ownerLogs.slice(0, 12).map((log) => (
+                      <div
+                        key={log.id}
+                        className="rounded-xl border border-white/12 bg-[#121212] px-3 py-2 font-mono text-[10.5px] text-white/75"
+                      >
+                        <div className="flex items-center justify-between gap-2">
+                          <span className="font-semibold text-white">{log.action}</span>
+                          <span className="text-[9.5px] text-white/40">
+                            {log.createdAt ? new Date(getMillis(log.createdAt)).toLocaleString() : 'pending'}
+                          </span>
+                        </div>
+                        {(log.targetUid || log.details) && (
+                          <div className="mt-0.5 truncate text-[10px] text-white/55">
+                            {log.targetUid ? `${log.targetUid} • ` : ''}
+                            {log.details || ''}
+                          </div>
+                        )}
+                      </div>
+                    ))
+                  )}
+                </div>
               </div>
             </div>
           </div>

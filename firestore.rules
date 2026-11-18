@@ -7,7 +7,13 @@ service cloud.firestore {
 
     function isOwnerAdmin() {
       return isSignedIn() && (
-        request.auth.uid == 'Y63ZCswFUsZbdBtbi1O4RLRV3ii2' ||
+        (
+          exists(/databases/$(database)/documents/users/$(request.auth.uid)) &&
+          (
+            get(/databases/$(database)/documents/users/$(request.auth.uid)).data.get('role', 'user') == 'admin' ||
+            get(/databases/$(database)/documents/users/$(request.auth.uid)).data.get('isAdmin', false) == true
+          )
+        ) ||
         exists(/databases/$(database)/documents/admins/$(request.auth.uid))
       );
     }
@@ -30,6 +36,11 @@ service cloud.firestore {
     function isAcceptedContact(chatId) {
       return exists(/databases/$(database)/documents/contactRequests/$(chatId)) &&
         get(/databases/$(database)/documents/contactRequests/$(chatId)).data.status == 'accepted';
+    }
+
+    function isAcceptedPair(uidA, uidB) {
+      return exists(/databases/$(database)/documents/users/$(uidA)/contacts/$(uidB)) ||
+        exists(/databases/$(database)/documents/users/$(uidB)/contacts/$(uidA));
     }
 
     function isValidMessagePayload() {
@@ -72,39 +83,88 @@ service cloud.firestore {
         && allowNewSignups()
         && request.auth.uid == userId
         && request.resource.data.uid == userId
-        && request.resource.data.usernameLower.matches('^[a-z0-9_]{3,12}$')
+        && request.resource.data.get('role', 'user') == 'user'
+        && request.resource.data.get('isAdmin', false) == false
         && request.resource.data.get('isBanned', false) == false
-        && request.resource.data.get('badge', '') == '';
+        && request.resource.data.get('badge', '') == ''
+        && (
+          !('usernameLower' in request.resource.data)
+          || request.resource.data.usernameLower == ''
+          || request.resource.data.usernameLower.matches('^[a-z0-9_]{3,12}$')
+        );
       allow update: if (
         isSignedIn()
         && request.auth.uid == userId
         && request.resource.data.uid == userId
-        && request.resource.data.usernameLower == resource.data.usernameLower
+        && (
+          !('usernameLower' in resource.data)
+          || resource.data.usernameLower == ''
+          || request.resource.data.usernameLower == resource.data.usernameLower
+        )
+        && (
+          !('usernameLower' in request.resource.data)
+          || request.resource.data.usernameLower == ''
+          || request.resource.data.usernameLower.matches('^[a-z0-9_]{3,12}$')
+        )
+        && request.resource.data.get('role', 'user') == resource.data.get('role', 'user')
+        && request.resource.data.get('isAdmin', false) == resource.data.get('isAdmin', false)
         && request.resource.data.get('isBanned', false) == resource.data.get('isBanned', false)
         && request.resource.data.get('badge', '') == resource.data.get('badge', '')
       ) || (
         isOwnerAdmin()
-        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['isBanned', 'badge', 'updatedAt'])
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['role', 'isAdmin', 'isBanned', 'badge', 'updatedAt'])
       );
       allow delete: if false;
+
+      match /contacts/{contactUid} {
+        allow read: if isSignedIn() && (request.auth.uid == userId || request.auth.uid == contactUid);
+        allow write: if isSignedIn() && isNotBanned() && (request.auth.uid == userId || request.auth.uid == contactUid);
+      }
     }
 
-    match /contactRequests/{pairId} {
-      allow get: if isSignedIn() && (resource == null || request.auth.uid in resource.data.participants);
-      allow list: if isSignedIn() && request.auth.uid in resource.data.participants;
+    match /contactRequests/{requestId} {
+      allow get: if isSignedIn() && (
+        resource == null
+        || request.auth.uid == resource.data.get('from', '')
+        || request.auth.uid == resource.data.get('to', '')
+        || request.auth.uid in resource.data.get('participants', [])
+      );
+      allow list: if isSignedIn() && (
+        request.auth.uid == resource.data.get('from', '')
+        || request.auth.uid == resource.data.get('to', '')
+        || request.auth.uid in resource.data.get('participants', [])
+      );
       allow create: if isSignedIn()
         && isNotBanned()
-        && request.resource.data.fromUid == request.auth.uid
-        && request.auth.uid in request.resource.data.participants
-        && request.resource.data.participants.size() == 2
-        && request.resource.data.status == 'pending';
-      allow update: if isSignedIn()
-        && request.auth.uid in resource.data.participants
+        && request.resource.data.status == 'pending'
         && (
-          (request.auth.uid == resource.data.toUid && request.resource.data.status in ['accepted', 'declined']) ||
-          (request.auth.uid == resource.data.fromUid && request.resource.data.status == 'pending')
+          (
+            request.resource.data.from == request.auth.uid
+            && request.resource.data.to is string
+            && request.resource.data.to != request.auth.uid
+          )
+          || (
+            request.resource.data.fromUid == request.auth.uid
+            && request.auth.uid in request.resource.data.participants
+            && request.resource.data.participants.size() == 2
+          )
         );
-      allow delete: if isSignedIn() && request.auth.uid in resource.data.participants;
+      allow update: if isSignedIn() && (
+        (request.auth.uid == resource.data.get('to', '') && request.resource.data.status in ['accepted', 'declined'])
+        || (request.auth.uid == resource.data.get('from', '') && request.resource.data.status == 'pending')
+        || (
+          request.auth.uid in resource.data.get('participants', [])
+          && (
+            (request.auth.uid == resource.data.get('toUid', '') && request.resource.data.status in ['accepted', 'declined'])
+            || (request.auth.uid == resource.data.get('fromUid', '') && request.resource.data.status == 'pending')
+          )
+        )
+      );
+      allow delete: if isSignedIn() && (
+        request.auth.uid == resource.data.get('from', '')
+        || request.auth.uid == resource.data.get('to', '')
+        || request.auth.uid in resource.data.get('participants', [])
+      );
     }
 
     match /chats/{chatId} {
@@ -113,10 +173,19 @@ service cloud.firestore {
       allow create: if isSignedIn()
         && request.auth.uid in request.resource.data.participants
         && request.resource.data.participants.size() == 2
-        && isAcceptedContact(chatId);
+        && (
+          isAcceptedContact(chatId)
+          || isAcceptedPair(request.resource.data.participants[0], request.resource.data.participants[1])
+        );
       allow update: if isSignedIn()
         && request.auth.uid in resource.data.participants
-        && isAcceptedContact(chatId);
+        && (
+          isAcceptedContact(chatId)
+          || (
+            resource.data.participants.size() == 2
+            && isAcceptedPair(resource.data.participants[0], resource.data.participants[1])
+          )
+        );
 
       match /messages/{messageId} {
         allow read: if isSignedIn()
@@ -124,12 +193,24 @@ service cloud.firestore {
         allow create: if isSignedIn()
           && isNotBanned()
           && request.auth.uid in get(/databases/$(database)/documents/chats/$(chatId)).data.participants
-          && isAcceptedContact(chatId)
+          && (
+            isAcceptedContact(chatId)
+            || isAcceptedPair(
+              get(/databases/$(database)/documents/chats/$(chatId)).data.participants[0],
+              get(/databases/$(database)/documents/chats/$(chatId)).data.participants[1]
+            )
+          )
           && isValidMessagePayload();
         allow update: if isSignedIn()
           && isNotBanned()
           && request.auth.uid in get(/databases/$(database)/documents/chats/$(chatId)).data.participants
-          && isAcceptedContact(chatId);
+          && (
+            isAcceptedContact(chatId)
+            || isAcceptedPair(
+              get(/databases/$(database)/documents/chats/$(chatId)).data.participants[0],
+              get(/databases/$(database)/documents/chats/$(chatId)).data.participants[1]
+            )
+          );
         allow delete: if false;
       }
     }
@@ -144,11 +225,8 @@ service cloud.firestore {
       allow update: if isSignedIn()
         && request.auth.uid in resource.data.members
         && (
-          // Leaving group
           !(request.auth.uid in request.resource.data.members)
-          ||
-          // Regular group/family update respecting admin permissions
-          (
+          || (
             (!resource.data.permissions.onlyAdminsEditInfo || request.auth.uid in resource.data.admins || (request.resource.data.name == resource.data.name && request.resource.data.permissions == resource.data.permissions))
             &&
             (!resource.data.permissions.onlyAdminsAddMembers || request.auth.uid in resource.data.admins || request.resource.data.members == resource.data.members)
@@ -178,6 +256,19 @@ service cloud.firestore {
           && request.auth.uid in get(/databases/$(database)/documents/groups/$(groupId)).data.members;
         allow delete: if false;
       }
+    }
+
+    match /adminLogs/{logId} {
+      allow read, create: if isOwnerAdmin();
+      allow update, delete: if false;
+    }
+
+    match /reports/{reportId} {
+      allow read, update: if isOwnerAdmin();
+      allow create: if isSignedIn()
+        && isNotBanned()
+        && request.resource.data.reporterUid == request.auth.uid;
+      allow delete: if false;
     }
 
     match /admins/{adminUid} {

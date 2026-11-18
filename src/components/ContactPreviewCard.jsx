@@ -6,6 +6,7 @@ export function ContactPreviewCard({
   user,
   relationship, // 'self' | 'accepted' | 'outgoing' | 'incoming' | 'none'
   loading,
+  statusMessage = '',
   isModal = false,
   onAddContact,
   onAcceptRequest,
@@ -16,6 +17,8 @@ export function ContactPreviewCard({
 
   const hasActiveNote =
     user.statusNote && user.statusExpiresAt && user.statusExpiresAt > Date.now();
+  const displayName = user.nickname || user.displayName || (user.usernameLower ? `@${user.usernameLower}` : user.email || 'Voliud User');
+  const secondaryHandle = user.usernameLower ? `@${user.usernameLower}` : user.email || '';
 
   const card = (
     <Tilt3DCard
@@ -26,23 +29,28 @@ export function ContactPreviewCard({
         <div className="flex items-center gap-3.5 min-w-0">
           <AvatarRing3D
             src={user.photoURL}
-            name={user.nickname || user.usernameLower}
+            name={displayName}
             status={user.status || 'Online'}
             size={48}
             animated={false}
           />
           <div className="min-w-0">
             <div className="truncate text-base font-semibold text-white">
-              {user.nickname || `@${user.usernameLower}`}
+              {displayName}
             </div>
             <div className="flex items-center gap-2 font-mono text-xs text-white/55">
-              <span>@{user.usernameLower}</span>
+              <span className="truncate">{secondaryHandle}</span>
               <span>•</span>
-              <span className="inline-flex items-center gap-1 font-sans">
+              <span className="inline-flex shrink-0 items-center gap-1 font-sans">
                 <StatusDot status={user.status || 'Online'} />
                 {user.status || 'Online'}
               </span>
             </div>
+            {user.email && user.usernameLower && (
+              <div className="mt-0.5 truncate font-mono text-[10.5px] text-white/40">
+                {user.email}
+              </div>
+            )}
           </div>
         </div>
 
@@ -64,6 +72,12 @@ export function ContactPreviewCard({
         </div>
       )}
 
+      {statusMessage && (
+        <div className="mt-3 rounded-xl border border-white/20 bg-[#161616] px-3 py-2 text-center text-xs font-medium text-white/90">
+          {statusMessage}
+        </div>
+      )}
+
       <div className="mt-4">
         {relationship === 'self' ? (
           <div className="w-full rounded-2xl border border-white/15 bg-[#161616] py-2.5 text-center text-xs font-medium text-white/60">
@@ -76,12 +90,12 @@ export function ContactPreviewCard({
             className="flex w-full items-center justify-center gap-2 rounded-2xl bg-white py-2.5 text-xs font-semibold text-black shadow-spatial-white transition active:scale-[0.98]"
           >
             <MessageSquare className="h-3.5 w-3.5" />
-            Message @{user.usernameLower}
+            Message {secondaryHandle || displayName}
           </button>
         ) : relationship === 'outgoing' ? (
           <div className="flex w-full items-center justify-center gap-2 rounded-2xl border border-white/20 bg-[#161616] py-2.5 text-xs font-medium text-white/75">
             <Clock className="h-3.5 w-3.5" />
-            Request Pending
+            Request already pending
           </div>
         ) : relationship === 'incoming' ? (
           <button
