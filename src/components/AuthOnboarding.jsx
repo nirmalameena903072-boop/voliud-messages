@@ -1,6 +1,7 @@
 import React, { useState } from 'react';
 import { ArrowRight, Check, KeyRound, ShieldCheck, Sparkles, Terminal } from 'lucide-react';
 import { REQUIRED_FIREBASE_KEYS, isFirebaseConfigured } from '../firebase';
+import { MAX_NICKNAME_LENGTH, isValidUsername, sanitizePlainText } from '../utils/security';
 import { Tilt3DCard, VEmblem3D } from './Spatial3D';
 
 export function FirebaseSetupBanner({ onEnterDemo }) {
@@ -136,15 +137,16 @@ export function OnboardingCard({
       setLocalError('New sign-ups are currently paused by the administrator.');
       return;
     }
-    if (!username || username.length < 2) {
-      setLocalError('Choose a handle between 2 and 12 characters ([a-z0-9_]).');
+    if (!isValidUsername(username)) {
+      setLocalError('Choose a handle between 3 and 12 characters ([a-z0-9_]).');
       return;
     }
-    if (!nickname.trim()) {
+    const cleanNickname = sanitizePlainText(nickname, MAX_NICKNAME_LENGTH, false);
+    if (!cleanNickname) {
       setLocalError('Enter a display nickname.');
       return;
     }
-    onComplete({ usernameLower: username, nickname: nickname.trim() });
+    onComplete({ usernameLower: username, nickname: cleanNickname });
   };
 
   const displayErr = localError || error;
@@ -203,12 +205,12 @@ export function OnboardingCard({
                 spellCheck={false}
                 className="w-full bg-transparent font-mono text-sm text-white placeholder:text-white/25 focus:outline-none"
               />
-              {username.length >= 2 && (
+              {username.length >= 3 && (
                 <Check className="ml-2 h-4 w-4 shrink-0 text-white/70" />
               )}
             </div>
             <p className="mt-1 text-[10.5px] text-white/40">
-              Lowercase letters, numbers, and underscores only (`a-z`, `0-9`, `_`).
+              3–12 characters: lowercase letters, numbers, and underscores only (`a-z`, `0-9`, `_`).
             </p>
           </div>
 

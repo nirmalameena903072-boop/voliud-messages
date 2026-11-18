@@ -45,6 +45,15 @@ import {
   X,
 } from 'lucide-react';
 import { OWNER_UID, auth, db, googleProvider, isFirebaseConfigured, rtdb } from './firebase';
+import {
+  MAX_BIO_LENGTH,
+  MAX_GROUP_NAME_LENGTH,
+  MAX_MESSAGE_LENGTH,
+  MAX_NICKNAME_LENGTH,
+  createRateLimiter,
+  isValidUsername,
+  sanitizePlainText,
+} from './utils/security';
 import { AvatarRing3D, StatusDot, Tilt3DCard } from './components/Spatial3D';
 import { LoginScreen, OnboardingCard } from './components/AuthOnboarding';
 import { ProfileStudioDrawer } from './components/ProfileStudioDrawer';
@@ -81,6 +90,8 @@ export default function App() {
   const [profileLoading, setProfileLoading] = useState(false);
   const [onboardError, setOnboardError] = useState('');
   const [isOwnerAdmin, setIsOwnerAdmin] = useState(false);
+  const [adminVerified, setAdminVerified] = useState(!isFirebaseConfigured);
+  const [rateLimitNotice, setRateLimitNotice] = useState('');
 
   // ?add=username URL detection
   const [pendingAddUsername, setPendingAddUsername] = useState(() => {
@@ -141,6 +152,24 @@ export default function App() {
   // Demo sandbox data store
   const [demoMessagesByChat, setDemoMessagesByChat] = useState({});
   const typingTimerRef = useRef(null);
+  const rateNoticeTimerRef = useRef(null);
+
+  // Client-side rate limiters (anti-spam / cooldown defense in depth)
+  const messageLimiterRef = useRef(
+    createRateLimiter({ minIntervalMs: 600, maxHits: 8, windowMs: 10000, label: 'Messaging' })
+  );
+  const contactRequestLimiterRef = useRef(
+    createRateLimiter({ minIntervalMs: 3000, maxHits: 5, windowMs: 60000, label: 'Contact requests' })
+  );
+  const groupCreateLimiterRef = useRef(
+    createRateLimiter({ minIntervalMs: 5000, maxHits: 3, windowMs: 60000, label: 'Group creation' })
+  );
+
+  const showRateNotice = (msg) => {
+    setRateLimitNotice(msg);
+    if (rateNoticeTimerRef.current) clearTimeout(rateNoticeTimerRef.current);
+    rateNoticeTimerRef.current = setTimeout(() => setRateLimitNotice(''), 3200);
+  };
 
   // ---------------------------------------------------------------------------
   // 0. Global App State Listener (config/appState - single doc, Spark friendly)
@@ -190,7 +219,15 @@ export default function App() {
       if (!user) {
         setMyProfile(null);
         setIsOwnerAdmin(false);
+        setAdminVerified(false);
         setActiveChat(null);
+        setOwnerConsoleOpen(false);
+        setProfileOpen(false);
+        setNotifOpen(false);
+        setNewGroupOpen(false);
+        setGroupInfoOpen(false);
+        setOwnerDirectory([]);
+        setOwnerStats({ users: null, groups: null });
       }
     });
 
@@ -201,7 +238,11 @@ export default function App() {
   useEffect(() => {
     if (!isFirebaseConfigured || !db || !authUser) return;
 
+    let cancelled = false;
     setProfileLoading(true);
+    setAdminVerified(false);
+    setIsOwnerAdmin(false);
+
     const userDocRef = doc(db, 'users', authUser.uid);
     const unsubUser = onSnapshot(
       userDocRef,
@@ -219,16 +260,26 @@ export default function App() {
     );
 
     const matchesOwnerUid = Boolean(OWNER_UID && authUser.uid === OWNER_UID);
-    if (matchesOwnerUid) {
-      setIsOwnerAdmin(true);
-    }
-
     const adminRef = doc(db, 'admins', authUser.uid);
     getDoc(adminRef)
-      .then((snap) => setIsOwnerAdmin(matchesOwnerUid || snap.exists()))
-      .catch(() => setIsOwnerAdmin(matchesOwnerUid));
+      .then((snap) => {
+        if (cancelled) return;
+        const verified = matchesOwnerUid || snap.exists();
+        setIsOwnerAdmin(verified);
+        setAdminVerified(true);
+        if (!verified) setOwnerConsoleOpen(false);
+      })
+      .catch(() => {
+        if (cancelled) return;
+        setIsOwnerAdmin(matchesOwnerUid);
+        setAdminVerified(true);
+        if (!matchesOwnerUid) setOwnerConsoleOpen(false);
+      });
 
-    return () => unsubUser();
+    return () => {
+      cancelled = true;
+      unsubUser();
+    };
   }, [authUser]);
 
   // ---------------------------------------------------------------------------
@@ -520,11 +571,19 @@ export default function App() {
       if (!appState.allowNewSignups) {
         throw new Error('New sign-ups are currently disabled by the administrator.');
       }
+      const cleanUsername = normalizeHandle(usernameLower);
+      const cleanNickname = sanitizePlainText(nickname, MAX_NICKNAME_LENGTH, false);
+      if (!isValidUsername(cleanUsername)) {
+        throw new Error('Username must be 3 to 12 lowercase letters, numbers, or underscores.');
+      }
+      if (!cleanNickname) {
+        throw new Error('Display nickname is required.');
+      }
       if (demoMode) {
         const profile = {
           uid: 'demo_me',
-          usernameLower,
-          nickname,
+          usernameLower: cleanUsername,
+          nickname: cleanNickname,
           photoURL: '',
           status: 'Online',
           statusNote: '',
@@ -540,10 +599,10 @@ export default function App() {
       if (!db || !authUser) return;
 
       await runTransaction(db, async (tx) => {
-        const unameRef = doc(db, 'usernames', usernameLower);
+        const unameRef = doc(db, 'usernames', cleanUsername);
         const unameSnap = await tx.get(unameRef);
         if (unameSnap.exists()) {
-          throw new Error(`@${usernameLower} is already claimed. Pick another.`);
+          throw new Error(`@${cleanUsername} is already claimed. Pick another.`);
         }
 
         const userRef = doc(db, 'users', authUser.uid);
@@ -555,8 +614,8 @@ export default function App() {
         const nowTs = serverTimestamp();
         tx.set(unameRef, {
           uid: authUser.uid,
-          usernameLower,
-          nickname,
+          usernameLower: cleanUsername,
+          nickname: cleanNickname,
           photoURL: authUser.photoURL || '',
           status: 'Online',
           createdAt: nowTs,
@@ -564,8 +623,8 @@ export default function App() {
 
         tx.set(userRef, {
           uid: authUser.uid,
-          usernameLower,
-          nickname,
+          usernameLower: cleanUsername,
+          nickname: cleanNickname,
           photoURL: authUser.photoURL || '',
           status: 'Online',
           statusNote: '',
@@ -603,20 +662,25 @@ export default function App() {
   // ---------------------------------------------------------------------------
   const handleSaveProfile = async (updates) => {
     if (!myProfile) return;
+    const cleanUpdates = {
+      ...updates,
+      nickname: sanitizePlainText(updates.nickname, MAX_NICKNAME_LENGTH, false) || myProfile.nickname,
+      statusNote: sanitizePlainText(updates.statusNote, MAX_BIO_LENGTH, false),
+    };
     if (demoMode) {
-      const updated = { ...myProfile, ...updates };
+      const updated = { ...myProfile, ...cleanUpdates };
       setMyProfile(updated);
       setUserProfilesMap((prev) => ({ ...prev, [myProfile.uid]: updated }));
       return;
     }
 
     await updateDoc(doc(db, 'users', myProfile.uid), {
-      ...updates,
+      ...cleanUpdates,
       updatedAt: serverTimestamp(),
     });
     await updateDoc(doc(db, 'usernames', myProfile.usernameLower), {
-      nickname: updates.nickname,
-      status: updates.status,
+      nickname: cleanUpdates.nickname,
+      status: cleanUpdates.status,
     });
   };
 
@@ -728,7 +792,7 @@ export default function App() {
   };
 
   const openOwnerConsole = () => {
-    if (!isOwnerAdmin) return;
+    if (!authReady || (!authUser && !demoMode) || !adminVerified || !isOwnerAdmin) return;
     setOwnerError('');
     setOwnerNotice('');
     setAnnouncementActiveDraft(Boolean(appState.announcement?.active));
@@ -884,6 +948,11 @@ export default function App() {
       setSearchError('');
       return;
     }
+    if (!isValidUsername(clean)) {
+      setSearchResult(null);
+      setSearchError('Enter a valid 3–12 character @username (letters, numbers, underscores).');
+      return;
+    }
     setSearching(true);
     setSearchError('');
     try {
@@ -903,6 +972,11 @@ export default function App() {
 
   const handleAddContact = async (targetUser) => {
     if (!myProfile || !targetUser || targetUser.uid === myProfile.uid) return;
+    const gate = contactRequestLimiterRef.current.check();
+    if (!gate.allowed) {
+      setSearchError(gate.message);
+      return;
+    }
     const pairId = getPairId(myProfile.uid, targetUser.uid);
     setBusyActionId(pairId);
 
@@ -1034,22 +1108,36 @@ export default function App() {
   // Handlers: Messaging, Typing, Calls, Polls, Groups
   // ---------------------------------------------------------------------------
   const sendMessagePayload = async (payload) => {
-    if (!activeChat || !myProfile || myProfile.isBanned) return;
+    if (!activeChat || !myProfile || myProfile.isBanned) return false;
+
+    const gate = messageLimiterRef.current.check();
+    if (!gate.allowed) {
+      showRateNotice(gate.message);
+      return false;
+    }
+
+    const sanitizedText = sanitizePlainText(payload.text, MAX_MESSAGE_LENGTH, true);
+    if (payload.type === 'text' && !sanitizedText) return false;
+
+    const sanitizedPayload = {
+      ...payload,
+      text: sanitizedText || payload.text,
+    };
 
     const baseMsg = {
       senderUid: myProfile.uid,
       senderUsername: myProfile.usernameLower,
       senderNickname: myProfile.nickname,
       createdAtMs: Date.now(),
-      ...payload,
+      ...sanitizedPayload,
     };
 
     const previewText =
-      payload.type === 'call_invite'
+      sanitizedPayload.type === 'call_invite'
         ? 'Video Call Invite'
-        : payload.type === 'poll'
-        ? `Poll: ${payload.poll?.question || ''}`
-        : payload.text;
+        : sanitizedPayload.type === 'poll'
+        ? `Poll: ${sanitizedPayload.poll?.question || ''}`
+        : sanitizedPayload.text;
 
     if (demoMode) {
       const msgWithId = { ...baseMsg, id: `m_${Date.now()}_${Math.random().toString(36).slice(2, 6)}` };
@@ -1062,18 +1150,20 @@ export default function App() {
           ...prev,
           [activeChat.id]: {
             ...(prev[activeChat.id] || { id: activeChat.id, participants: [myProfile.uid, activeChat.peerUid] }),
-            lastMessage: previewText,
+            lastMessage: previewText.slice(0, 140),
             updatedAtMs: Date.now(),
           },
         }));
       } else {
         setGroups((prev) =>
           prev.map((g) =>
-            g.id === activeChat.id ? { ...g, lastMessage: previewText, updatedAtMs: Date.now() } : g
+            g.id === activeChat.id
+              ? { ...g, lastMessage: previewText.slice(0, 140), updatedAtMs: Date.now() }
+              : g
           )
         );
       }
-      return;
+      return true;
     }
 
     const colName = activeChat.type === 'group' ? 'groups' : 'chats';
@@ -1084,15 +1174,16 @@ export default function App() {
     await setDoc(
       doc(db, colName, activeChat.id),
       {
-        lastMessage: previewText,
+        lastMessage: previewText.slice(0, 140),
         updatedAt: serverTimestamp(),
       },
       { merge: true }
     );
+    return true;
   };
 
   const handleSendMessage = async (text, replyTo) => {
-    await sendMessagePayload({
+    return sendMessagePayload({
       type: 'text',
       text,
       ...(replyTo ? { replyTo } : {}),
@@ -1131,12 +1222,18 @@ export default function App() {
   };
 
   const handleSendPoll = async (question, optionTexts) => {
-    await sendMessagePayload({
+    const cleanQ = sanitizePlainText(question, 160, false);
+    const cleanOpts = optionTexts
+      .map((o) => sanitizePlainText(o, 80, false))
+      .filter(Boolean)
+      .slice(0, 6);
+    if (!cleanQ || cleanOpts.length < 2) return false;
+    return sendMessagePayload({
       type: 'poll',
-      text: question,
+      text: cleanQ,
       poll: {
-        question,
-        options: optionTexts.map((opt, idx) => ({
+        question: cleanQ,
+        options: cleanOpts.map((opt, idx) => ({
           id: `opt_${idx}_${Date.now()}`,
           text: opt,
           votes: [],
@@ -1228,12 +1325,20 @@ export default function App() {
   // ---------------------------------------------------------------------------
   const handleCreateGroup = async ({ name, memberUids, familyMode }) => {
     if (!myProfile) return;
+    const gate = groupCreateLimiterRef.current.check();
+    if (!gate.allowed) {
+      throw new Error(gate.message);
+    }
+    const cleanName = sanitizePlainText(name, MAX_GROUP_NAME_LENGTH, false);
+    if (cleanName.length < 2) {
+      throw new Error('Group name must be at least 2 characters.');
+    }
     const allMembers = Array.from(new Set([myProfile.uid, ...memberUids]));
     const newGroup = {
-      name,
+      name: cleanName,
       members: allMembers,
       admins: [myProfile.uid],
-      familyMode,
+      familyMode: Boolean(familyMode),
       familyChecklist: [],
       familyNote: '',
       permissions: {
@@ -1261,12 +1366,14 @@ export default function App() {
   };
 
   const handleUpdateGroupName = async (groupId, nextName) => {
+    const cleanName = sanitizePlainText(nextName, MAX_GROUP_NAME_LENGTH, false);
+    if (cleanName.length < 2) return;
     if (demoMode) {
-      setGroups((prev) => prev.map((g) => (g.id === groupId ? { ...g, name: nextName } : g)));
+      setGroups((prev) => prev.map((g) => (g.id === groupId ? { ...g, name: cleanName } : g)));
       return;
     }
     await updateDoc(doc(db, 'groups', groupId), {
-      name: nextName,
+      name: cleanName,
       updatedAt: serverTimestamp(),
     });
   };
@@ -1606,6 +1713,7 @@ export default function App() {
           messages={messages}
           typingUsers={typingUsers}
           allowVideoCalls={appState.allowVideoCalls}
+          rateLimitNotice={rateLimitNotice}
           onBack={() => setActiveChat(null)}
           onOpenGroupInfo={() => setGroupInfoOpen(true)}
           onSendMessage={handleSendMessage}
@@ -1921,6 +2029,10 @@ export default function App() {
     );
   };
 
+  const isProtectedSessionReady =
+    authReady && !profileLoading && Boolean(authUser || demoMode) && Boolean(myProfile);
+  const isVerifiedAdmin = isProtectedSessionReady && adminVerified && isOwnerAdmin;
+
   const showGlobalBanner =
     Boolean(appState.announcement?.active) &&
     Boolean(appState.announcement?.text?.trim()) &&
@@ -1964,7 +2076,7 @@ export default function App() {
         </div>
 
         {/* ?add=username Auto-Popup 3D Profile Preview Card */}
-        {inviteModalUser && myProfile && (
+        {isProtectedSessionReady && inviteModalUser && (
           <ContactPreviewCard
             isModal
             user={inviteModalUser}
@@ -1978,18 +2090,20 @@ export default function App() {
         )}
 
         {/* Profile Studio 3D Slide-up Drawer */}
-        <ProfileStudioDrawer
-          open={profileOpen}
-          onClose={() => setProfileOpen(false)}
-          profile={myProfile}
-          isOwnerAdmin={isOwnerAdmin}
-          onSaveProfile={handleSaveProfile}
-          onOpenOwnerConsole={openOwnerConsole}
-          onSignOut={handleSignOut}
-        />
+        {isProtectedSessionReady && (
+          <ProfileStudioDrawer
+            open={profileOpen}
+            onClose={() => setProfileOpen(false)}
+            profile={myProfile}
+            isOwnerAdmin={isVerifiedAdmin}
+            onSaveProfile={handleSaveProfile}
+            onOpenOwnerConsole={openOwnerConsole}
+            onSignOut={handleSignOut}
+          />
+        )}
 
         {/* Owner / Admin Console (Spark-plan friendly) */}
-        {ownerConsoleOpen && isOwnerAdmin && (
+        {ownerConsoleOpen && isVerifiedAdmin && (
           <div
             className="fixed inset-0 z-50 flex items-end justify-center bg-black/85 backdrop-blur-md"
             onClick={() => setOwnerConsoleOpen(false)}
@@ -2354,39 +2468,45 @@ export default function App() {
         )}
 
         {/* Notification Bell Drawer */}
-        <NotificationsDrawer
-          open={notifOpen}
-          onClose={() => setNotifOpen(false)}
-          incomingRequests={incomingRequests}
-          outgoingRequests={outgoingRequests}
-          onAccept={handleAcceptRequest}
-          onDecline={handleDeclineRequest}
-          onCancelOutgoing={handleCancelOutgoing}
-          busyPairId={busyActionId}
-        />
+        {isProtectedSessionReady && (
+          <NotificationsDrawer
+            open={notifOpen}
+            onClose={() => setNotifOpen(false)}
+            incomingRequests={incomingRequests}
+            outgoingRequests={outgoingRequests}
+            onAccept={handleAcceptRequest}
+            onDecline={handleDeclineRequest}
+            onCancelOutgoing={handleCancelOutgoing}
+            busyPairId={busyActionId}
+          />
+        )}
 
         {/* New Group Modal */}
-        <NewGroupModal
-          open={newGroupOpen}
-          onClose={() => setNewGroupOpen(false)}
-          contacts={acceptedContacts}
-          onCreateGroup={handleCreateGroup}
-        />
+        {isProtectedSessionReady && (
+          <NewGroupModal
+            open={newGroupOpen}
+            onClose={() => setNewGroupOpen(false)}
+            contacts={acceptedContacts}
+            onCreateGroup={handleCreateGroup}
+          />
+        )}
 
         {/* Group Info Drawer */}
-        <GroupInfoDrawer
-          open={groupInfoOpen}
-          onClose={() => setGroupInfoOpen(false)}
-          group={activeGroup}
-          myUid={myProfile?.uid}
-          memberProfiles={userProfilesMap}
-          acceptedContacts={acceptedContacts}
-          onUpdateGroupName={handleUpdateGroupName}
-          onTogglePermission={handleTogglePermission}
-          onAddMember={handleAddGroupMember}
-          onPromoteAdmin={handlePromoteAdmin}
-          onExitGroup={handleExitGroup}
-        />
+        {isProtectedSessionReady && (
+          <GroupInfoDrawer
+            open={groupInfoOpen}
+            onClose={() => setGroupInfoOpen(false)}
+            group={activeGroup}
+            myUid={myProfile?.uid}
+            memberProfiles={userProfilesMap}
+            acceptedContacts={acceptedContacts}
+            onUpdateGroupName={handleUpdateGroupName}
+            onTogglePermission={handleTogglePermission}
+            onAddMember={handleAddGroupMember}
+            onPromoteAdmin={handlePromoteAdmin}
+            onExitGroup={handleExitGroup}
+          />
+        )}
       </div>
     </div>
   );

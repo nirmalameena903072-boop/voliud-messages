@@ -9,6 +9,7 @@ import {
   Shield,
   X,
 } from 'lucide-react';
+import { MAX_BIO_LENGTH, MAX_NICKNAME_LENGTH, sanitizePlainText } from '../utils/security';
 import { AvatarRing3D, StatusDot, Tilt3DCard } from './Spatial3D';
 
 const STATUS_OPTIONS = ['Online', 'Studying', 'Busy'];
@@ -44,7 +45,7 @@ export function ProfileStudioDrawer({
 
   if (!open || !profile) return null;
 
-  const inviteUrl = `${window.location.origin}/?add=${profile.usernameLower}`;
+  const inviteUrl = `${window.location.origin}/?add=${encodeURIComponent(profile.usernameLower || '')}`;
 
   const handleCopyInvite = async () => {
     try {
@@ -59,15 +60,16 @@ export function ProfileStudioDrawer({
 
   const handleSave = async (e) => {
     e.preventDefault();
-    if (!nickname.trim()) return;
+    const cleanNickname = sanitizePlainText(nickname, MAX_NICKNAME_LENGTH, false);
+    if (!cleanNickname) return;
     setSaving(true);
     try {
-      const trimmedNote = statusNote.trim();
+      const cleanNote = sanitizePlainText(statusNote, MAX_BIO_LENGTH, false);
       await onSaveProfile({
-        nickname: nickname.trim(),
+        nickname: cleanNickname,
         status,
-        statusNote: trimmedNote,
-        statusExpiresAt: trimmedNote ? Date.now() + 24 * 60 * 60 * 1000 : null,
+        statusNote: cleanNote,
+        statusExpiresAt: cleanNote ? Date.now() + 24 * 60 * 60 * 1000 : null,
       });
       setSavedFeedback(true);
       setTimeout(() => setSavedFeedback(false), 1600);

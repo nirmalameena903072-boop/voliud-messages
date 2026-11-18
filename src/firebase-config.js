@@ -1,11 +1,15 @@
+const env = typeof import.meta !== 'undefined' && import.meta.env ? import.meta.env : {};
+
 export const firebaseConfig = {
-  apiKey: 'AIzaSyDlijarDABFRtan-cWh_yUPs6kVvlhg1ZU',
-  authDomain: 'voliud-messages.firebaseapp.com',
-  databaseURL: 'https://voliud-messages-default-rtdb.asia-southeast1.firebasedatabase.app',
-  projectId: 'voliud-messages',
-  storageBucket: 'voliud-messages.firebasestorage.app',
-  messagingSenderId: '1009055198345',
-  appId: '1:1009055198345:web:2536e2658268315dd82a58',
+  apiKey: env.VITE_FIREBASE_API_KEY || 'AIzaSyDlijarDABFRtan-cWh_yUPs6kVvlhg1ZU',
+  authDomain: env.VITE_FIREBASE_AUTH_DOMAIN || 'voliud-messages.firebaseapp.com',
+  databaseURL:
+    env.VITE_FIREBASE_DATABASE_URL ||
+    'https://voliud-messages-default-rtdb.asia-southeast1.firebasedatabase.app',
+  projectId: env.VITE_FIREBASE_PROJECT_ID || 'voliud-messages',
+  storageBucket: env.VITE_FIREBASE_STORAGE_BUCKET || 'voliud-messages.firebasestorage.app',
+  messagingSenderId: env.VITE_FIREBASE_MESSAGING_SENDER_ID || '1009055198345',
+  appId: env.VITE_FIREBASE_APP_ID || '1:1009055198345:web:2536e2658268315dd82a58',
 };
 
 export const REQUIRED_FIREBASE_KEYS = [
@@ -25,4 +29,4 @@ export const missingFirebaseKeys = REQUIRED_FIREBASE_KEYS.filter(({ key }) => {
 
 export const isFirebaseConfigured = missingFirebaseKeys.length === 0;
 export const DEMO_MODE = !isFirebaseConfigured;
-export const resolvedOwnerUid = 'Y63ZCswFUsZbdBtbi1O4RLRV3ii2';
+export const resolvedOwnerUid = env.VITE_OWNER_UID || 'Y63ZCswFUsZbdBtbi1O4RLRV3ii2';

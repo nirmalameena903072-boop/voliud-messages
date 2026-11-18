@@ -32,6 +32,20 @@ service cloud.firestore {
         get(/databases/$(database)/documents/contactRequests/$(chatId)).data.status == 'accepted';
     }
 
+    function isValidMessagePayload() {
+      return request.resource.data.senderUid == request.auth.uid
+        && request.resource.data.text is string
+        && request.resource.data.text.size() <= 4000
+        && (
+          request.resource.data.type != 'call_invite'
+          || (
+            allowVideoCalls()
+            && request.resource.data.call.roomUrl is string
+            && request.resource.data.call.roomUrl.matches('^https://meet\\.jit\\.si/voliud-[0-9]+$')
+          )
+        );
+    }
+
     match /config/appState {
       allow read: if true;
       allow write: if isOwnerAdmin();
@@ -41,7 +55,7 @@ service cloud.firestore {
       allow read: if isSignedIn();
       allow create: if isSignedIn()
         && allowNewSignups()
-        && username.matches('^[a-z0-9_]{1,12}$')
+        && username.matches('^[a-z0-9_]{3,12}$')
         && request.resource.data.uid == request.auth.uid
         && request.resource.data.usernameLower == username
         && !exists(/databases/$(database)/documents/usernames/$(username));
@@ -58,7 +72,7 @@ service cloud.firestore {
         && allowNewSignups()
         && request.auth.uid == userId
         && request.resource.data.uid == userId
-        && request.resource.data.usernameLower.matches('^[a-z0-9_]{1,12}$')
+        && request.resource.data.usernameLower.matches('^[a-z0-9_]{3,12}$')
         && request.resource.data.get('isBanned', false) == false
         && request.resource.data.get('badge', '') == '';
       allow update: if (
@@ -111,8 +125,7 @@ service cloud.firestore {
           && isNotBanned()
           && request.auth.uid in get(/databases/$(database)/documents/chats/$(chatId)).data.participants
           && isAcceptedContact(chatId)
-          && request.resource.data.senderUid == request.auth.uid
-          && (request.resource.data.type != 'call_invite' || allowVideoCalls());
+          && isValidMessagePayload();
         allow update: if isSignedIn()
           && isNotBanned()
           && request.auth.uid in get(/databases/$(database)/documents/chats/$(chatId)).data.participants
@@ -155,8 +168,7 @@ service cloud.firestore {
         allow create: if isSignedIn()
           && isNotBanned()
           && request.auth.uid in get(/databases/$(database)/documents/groups/$(groupId)).data.members
-          && request.resource.data.senderUid == request.auth.uid
-          && (request.resource.data.type != 'call_invite' || allowVideoCalls())
+          && isValidMessagePayload()
           && (
             !get(/databases/$(database)/documents/groups/$(groupId)).data.permissions.onlyAdminsSendMessages
             || request.auth.uid in get(/databases/$(database)/documents/groups/$(groupId)).data.admins

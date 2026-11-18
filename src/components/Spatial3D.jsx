@@ -1,4 +1,5 @@
 import React, { useRef, useState } from 'react';
+import { sanitizeImageUrl } from '../utils/security';
 
 /**
  * Interactive 3D tilt card using pure CSS perspective + pointer/touch tilt.
@@ -158,6 +159,7 @@ export function AvatarRing3D({
   onClick,
 }) {
   const initials = (name || 'V').trim().slice(0, 2).toUpperCase();
+  const safeSrc = sanitizeImageUrl(src);
 
   return (
     <button
@@ -183,9 +185,9 @@ export function AvatarRing3D({
         className="relative flex items-center justify-center overflow-hidden rounded-full bg-[#161616] border border-white/20 text-xs font-semibold tracking-wider text-white transition-transform duration-200 group-hover:scale-95"
         style={{ width: size, height: size }}
       >
-        {src ? (
+        {safeSrc ? (
           <img
-            src={src}
+            src={safeSrc}
             alt={name}
             className="h-full w-full object-cover grayscale contrast-125"
             referrerPolicy="no-referrer"

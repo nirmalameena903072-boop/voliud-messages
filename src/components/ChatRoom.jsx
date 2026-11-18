@@ -18,10 +18,18 @@ import {
   Video,
   X,
 } from 'lucide-react';
+import {
+  MAX_CHECKLIST_ITEM_LENGTH,
+  MAX_FAMILY_NOTE_LENGTH,
+  MAX_MESSAGE_LENGTH,
+  sanitizeExternalUrl,
+  sanitizePlainText,
+} from '../utils/security';
 import { AvatarRing3D, StatusDot, Tilt3DCard, TypingWave3D } from './Spatial3D';
 
 function CallInviteCard({ msg, isMine, now, onRespondCall }) {
   const call = msg.call || {};
+  const safeRoomUrl = sanitizeExternalUrl(call.roomUrl, ['meet.jit.si']);
   const expiresAt = call.expiresAt || 0;
   const remainingMs = Math.max(0, expiresAt - now);
   const remainingSec = Math.ceil(remainingMs / 1000);
@@ -29,8 +37,8 @@ function CallInviteCard({ msg, isMine, now, onRespondCall }) {
   const effectiveStatus = isExpired ? 'expired' : call.status || 'ringing';
 
   const handleAccept = () => {
-    if (call.roomUrl) {
-      window.open(call.roomUrl, '_blank', 'noopener,noreferrer');
+    if (safeRoomUrl) {
+      window.open(safeRoomUrl, '_blank', 'noopener,noreferrer');
     }
     onRespondCall(msg.id, 'accepted');
   };
@@ -136,9 +144,9 @@ function CallInviteCard({ msg, isMine, now, onRespondCall }) {
         </>
       )}
 
-      {effectiveStatus === 'accepted' && call.roomUrl && (
+      {effectiveStatus === 'accepted' && safeRoomUrl && (
         <a
-          href={call.roomUrl}
+          href={safeRoomUrl}
           target="_blank"
           rel="noopener noreferrer"
           className={`mt-3 flex w-full items-center justify-center gap-1.5 rounded-xl py-2 text-xs font-semibold transition ${
@@ -363,6 +371,7 @@ export function ChatRoom({
   messages,
   typingUsers,
   allowVideoCalls = true,
+  rateLimitNotice = '',
   onBack,
   onOpenGroupInfo,
   onSendMessage,
@@ -416,52 +425,64 @@ export function ChatRoom({
   }, [group?.familyNote]);
 
   const handleInputChange = (e) => {
-    const val = e.target.value;
+    const val = e.target.value.slice(0, MAX_MESSAGE_LENGTH);
     setText(val);
     onTypingChange(val.trim().length > 0);
   };
 
   const handleSubmit = async (e) => {
     e.preventDefault();
-    if (sendLocked || !text.trim()) return;
-    const body = text.trim();
+    if (sendLocked) return;
+    const body = sanitizePlainText(text, MAX_MESSAGE_LENGTH, true);
+    if (!body) return;
     const quote = replyTo
       ? {
           id: replyTo.id,
           senderUsername: replyTo.senderUsername,
           senderNickname: replyTo.senderNickname,
-          text:
+          text: sanitizePlainText(
             replyTo.type === 'poll'
               ? `Poll: ${replyTo.poll?.question || ''}`
               : replyTo.type === 'call_invite'
               ? 'Jitsi Video Call'
               : replyTo.text,
+            200,
+            false
+          ),
         }
       : null;
 
-    setText('');
-    setReplyTo(null);
-    onTypingChange(false);
-    await onSendMessage(body, quote);
+    const sent = await onSendMessage(body, quote);
+    if (sent !== false) {
+      setText('');
+      setReplyTo(null);
+      onTypingChange(false);
+    }
   };
 
   const handleCreatePoll = async (e) => {
     e.preventDefault();
-    const cleanOpts = pollOptions.map((o) => o.trim()).filter(Boolean);
-    if (!pollQuestion.trim() || cleanOpts.length < 2) return;
-    await onSendPoll(pollQuestion.trim(), cleanOpts);
-    setPollQuestion('');
-    setPollOptions(['', '']);
-    setShowPollModal(false);
+    const cleanQ = sanitizePlainText(pollQuestion, 160, false);
+    const cleanOpts = pollOptions
+      .map((o) => sanitizePlainText(o, 80, false))
+      .filter(Boolean);
+    if (!cleanQ || cleanOpts.length < 2) return;
+    const sent = await onSendPoll(cleanQ, cleanOpts);
+    if (sent !== false) {
+      setPollQuestion('');
+      setPollOptions(['', '']);
+      setShowPollModal(false);
+    }
   };
 
   const handleAddChecklistItem = async (e) => {
     e.preventDefault();
-    if (!group || !newTaskText.trim()) return;
+    const cleanTask = sanitizePlainText(newTaskText, MAX_CHECKLIST_ITEM_LENGTH, false);
+    if (!group || !cleanTask) return;
     const list = group.familyChecklist || [];
     const next = [
       ...list,
-      { id: `${Date.now()}-${Math.random().toString(36).slice(2, 6)}`, text: newTaskText.trim(), done: false },
+      { id: `${Date.now()}-${Math.random().toString(36).slice(2, 6)}`, text: cleanTask, done: false },
     ];
     setNewTaskText('');
     await onUpdateFamilyData(group.id, { familyChecklist: next });
@@ -484,7 +505,9 @@ export function ChatRoom({
   const saveFamilyNote = async () => {
     if (!group) return;
     setEditingNote(false);
-    await onUpdateFamilyData(group.id, { familyNote: noteDraft.trim() });
+    await onUpdateFamilyData(group.id, {
+      familyNote: sanitizePlainText(noteDraft, MAX_FAMILY_NOTE_LENGTH, false),
+    });
   };
 
   const title = isGroup
@@ -850,6 +873,13 @@ export function ChatRoom({
         </div>
       )}
 
+      {/* Rate Limit / Validation Notice */}
+      {rateLimitNotice && (
+        <div className="shrink-0 border-t border-white/15 bg-[#121212] px-4 py-1.5 text-center font-mono text-[11px] text-white/85">
+          {rateLimitNotice}
+        </div>
+      )}
+
       {/* Composer */}
       <footer className="shrink-0 border-t border-white/14 bg-[#080808] px-3 py-2.5 pb-[max(0.625rem,env(safe-area-inset-bottom))]">
         {sendLocked ? (
@@ -880,11 +910,18 @@ export function ChatRoom({
             <input
               ref={inputRef}
               type="text"
+              maxLength={MAX_MESSAGE_LENGTH}
               value={text}
               onChange={handleInputChange}
               placeholder="Message..."
               className="h-10 flex-1 rounded-full border border-white/16 bg-[#121212] px-4 text-sm text-white placeholder:text-white/30 focus:border-white focus:outline-none transition"
             />
+
+            {text.length > 3500 && (
+              <span className="shrink-0 font-mono text-[10px] text-white/55">
+                {text.length}/{MAX_MESSAGE_LENGTH}
+              </span>
+            )}
 
             <button
               type="submit"

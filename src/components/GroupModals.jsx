@@ -10,6 +10,7 @@ import {
   Users,
   X,
 } from 'lucide-react';
+import { MAX_GROUP_NAME_LENGTH, sanitizePlainText } from '../utils/security';
 import { AvatarRing3D, Tilt3DCard } from './Spatial3D';
 
 export function NewGroupModal({ open, onClose, contacts, onCreateGroup }) {
@@ -38,8 +39,9 @@ export function NewGroupModal({ open, onClose, contacts, onCreateGroup }) {
 
   const handleSubmit = async (e) => {
     e.preventDefault();
-    if (!name.trim()) {
-      setError('Enter a group name.');
+    const cleanName = sanitizePlainText(name, MAX_GROUP_NAME_LENGTH, false);
+    if (cleanName.length < 2) {
+      setError('Enter a group name (2–40 characters).');
       return;
     }
     if (selectedUids.length === 0) {
@@ -50,7 +52,7 @@ export function NewGroupModal({ open, onClose, contacts, onCreateGroup }) {
     setError('');
     try {
       await onCreateGroup({
-        name: name.trim(),
+        name: cleanName,
         memberUids: selectedUids,
         familyMode,
       });
@@ -264,10 +266,11 @@ export function GroupInfoDrawer({
 
   const handleSaveName = async (e) => {
     e.preventDefault();
-    if (!canEditInfo || !groupName.trim() || groupName.trim() === group.name) return;
+    const cleanName = sanitizePlainText(groupName, MAX_GROUP_NAME_LENGTH, false);
+    if (!canEditInfo || cleanName.length < 2 || cleanName === group.name) return;
     setSavingName(true);
     try {
-      await onUpdateGroupName(group.id, groupName.trim());
+      await onUpdateGroupName(group.id, cleanName);
     } finally {
       setSavingName(false);
     }
