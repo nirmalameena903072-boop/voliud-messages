@@ -6,8 +6,11 @@ import {
 } from 'firebase/auth';
 import {
   addDoc,
+  arrayRemove,
+  arrayUnion,
   collection,
   deleteDoc,
+  deleteField,
   doc,
   getCountFromServer,
   getDoc,
@@ -31,6 +34,7 @@ import {
   Check,
   FileText,
   Home,
+  Lock,
   Megaphone,
   MessageSquare,
   Plus,
@@ -40,9 +44,11 @@ import {
   Sparkles,
   Tag,
   Trash2,
+  Unlock,
   UserCheck,
   UserPlus,
   Users,
+  UserX,
   Video,
   X,
 } from 'lucide-react';
@@ -52,6 +58,7 @@ import {
   MAX_GROUP_NAME_LENGTH,
   MAX_MESSAGE_LENGTH,
   MAX_NICKNAME_LENGTH,
+  canUserBypassMessageLock,
   createRateLimiter,
   hasAdminAccess,
   isValidUsername,
@@ -172,6 +179,7 @@ export default function App() {
     announcement: { id: '', active: false, text: '' },
     allowNewSignups: true,
     allowVideoCalls: true,
+    adminOnlyMessaging: false,
   });
   const [dismissedBannerId, setDismissedBannerId] = useState(() => {
     try {
@@ -180,6 +188,17 @@ export default function App() {
       return '';
     }
   });
+
+  // Chat Lock (PIN) & Confirmation Dialog state
+  const [unlockedChatIds, setUnlockedChatIds] = useState({});
+  const [localClearedAtMap, setLocalClearedAtMap] = useState({});
+  const [pinModal, setPinModal] = useState(null); // { mode: 'create' | 'unlock', chatMeta, onUnlocked? }
+  const [pinInput, setPinInput] = useState('');
+  const [pinConfirmInput, setPinConfirmInput] = useState('');
+  const [pinError, setPinError] = useState('');
+  const [pinSaving, setPinSaving] = useState(false);
+  const [confirmDialog, setConfirmDialog] = useState(null); // { title, message, confirmLabel, tone, onConfirm }
+  const [confirmBusy, setConfirmBusy] = useState(false);
 
   // Owner / Admin Console (Spark-plan friendly on-demand queries + real-time reports)
   const [ownerConsoleOpen, setOwnerConsoleOpen] = useState(false);
@@ -313,6 +332,7 @@ export default function App() {
             },
             allowNewSignups: data.allowNewSignups !== false,
             allowVideoCalls: data.allowVideoCalls !== false,
+            adminOnlyMessaging: Boolean(data.adminOnlyMessaging),
           });
         }
       },
@@ -337,6 +357,10 @@ export default function App() {
         setIsOwnerAdmin(false);
         setAdminVerified(false);
         setActiveChat(null);
+        setUnlockedChatIds({});
+        setLocalClearedAtMap({});
+        setPinModal(null);
+        setConfirmDialog(null);
         setOwnerConsoleOpen(false);
         setProfileOpen(false);
         setNotifOpen(false);
@@ -820,12 +844,19 @@ export default function App() {
     [contactRequests, myProfile?.uid]
   );
 
+  const canBypassLock = useMemo(
+    () => canUserBypassMessageLock(myProfile, authUser?.uid || myProfile?.uid),
+    [myProfile, authUser?.uid]
+  );
+
   const acceptedContacts = useMemo(() => {
     if (!myProfile) return [];
     const byUid = new Map();
 
     userContactsDocs.forEach((c) => {
       if (!c.uid || c.uid === myProfile.uid) return;
+      const pairId = getPairId(myProfile.uid, c.uid);
+      if ((directChatsMap[pairId]?.hiddenFor || []).includes(myProfile.uid)) return;
       const liveProfile = userProfilesMap[c.uid];
       byUid.set(c.uid, liveProfile || c);
     });
@@ -840,6 +871,8 @@ export default function App() {
               : r.from
             : (r.participants || []).find((id) => id !== myProfile.uid);
         if (!peerUid || peerUid === myProfile.uid) return;
+        const pairId = getPairId(myProfile.uid, peerUid);
+        if ((directChatsMap[pairId]?.hiddenFor || []).includes(myProfile.uid)) return;
         const liveProfile = userProfilesMap[peerUid];
         if (liveProfile) {
           byUid.set(peerUid, liveProfile);
@@ -862,7 +895,7 @@ export default function App() {
       });
 
     return Array.from(byUid.values()).filter((c) => c.uid);
-  }, [contactRequests, userContactsDocs, myProfile, userProfilesMap]);
+  }, [contactRequests, userContactsDocs, directChatsMap, myProfile, userProfilesMap]);
 
   const getRelationship = useCallback(
     (targetUid) => {
@@ -2015,6 +2048,7 @@ export default function App() {
         doc(db, 'chats', pairId),
         {
           participants: [myUid, peerUid].sort(),
+          hiddenFor: arrayRemove(myUid, peerUid),
           updatedAt: serverTimestamp(),
         },
         { merge: true }
@@ -2065,28 +2099,354 @@ export default function App() {
     }
   };
 
+  const openChatWithPinCheck = useCallback(
+    (chatMeta, onAllowed) => {
+      if (!chatMeta?.id) return;
+      const savedPin = myProfile?.lockedChats?.[chatMeta.id];
+      if (savedPin && !unlockedChatIds[chatMeta.id]) {
+        setPinInput('');
+        setPinConfirmInput('');
+        setPinError('');
+        setPinModal({
+          mode: 'unlock',
+          chatMeta,
+          expectedPin: String(savedPin),
+          onUnlocked: onAllowed,
+        });
+        return;
+      }
+      onAllowed();
+    },
+    [myProfile?.lockedChats, unlockedChatIds]
+  );
+
   const openDirectChat = async (peerUser) => {
     if (!myProfile || !peerUser) return;
-    const chatId = getPairId(myProfile.uid, peerUser.uid);
+    const peerUid = String(peerUser.uid || peerUser.id || '');
+    if (!peerUid) return;
+    const chatId = getPairId(myProfile.uid, peerUid);
+    const enterChat = async () => {
+      try {
+        if (!demoMode && isFirebaseConfigured && db && !directChatsMap[chatId]) {
+          await setDoc(
+            doc(db, 'chats', chatId),
+            {
+              participants: [myProfile.uid, peerUid].sort(),
+              updatedAt: serverTimestamp(),
+            },
+            { merge: true }
+          );
+        }
+        setSearchResult(null);
+        setSearchInput('');
+        setContactStatusMessage('');
+        setInviteModalUser(null);
+        setActiveChat({ type: 'direct', id: chatId, peerUid });
+      } catch (err) {
+        showAppError('Open direct chat failed', err);
+      }
+    };
+
+    openChatWithPinCheck(
+      {
+        type: 'direct',
+        id: chatId,
+        peerUid,
+        label:
+          peerUser.nickname ||
+          peerUser.displayName ||
+          (peerUser.usernameLower ? `@${peerUser.usernameLower}` : 'Chat'),
+      },
+      enterChat
+    );
+  };
+
+  const openGroupChat = (group) => {
+    if (!group?.id) return;
+    openChatWithPinCheck(
+      {
+        type: 'group',
+        id: group.id,
+        label: group.name || 'Group Chat',
+      },
+      () => {
+        setActiveChat({ type: 'group', id: group.id });
+      }
+    );
+  };
+
+  // ---------------------------------------------------------------------------
+  // Handlers: Chat Lock (4-digit PIN), Clear Chat, Delete Contact, Delete Message
+  // ---------------------------------------------------------------------------
+  const handleToggleChatLock = (chatMeta) => {
+    if (!myProfile || !chatMeta?.id) return;
+    const chatId = chatMeta.id;
+    const existingPin = myProfile?.lockedChats?.[chatId];
+
+    if (existingPin) {
+      setConfirmDialog({
+        title: 'Unlock / Remove Lock',
+        message: `Remove the 4-digit PIN lock from "${chatMeta.label || 'this chat'}"?`,
+        confirmLabel: 'Remove Lock',
+        tone: 'default',
+        onConfirm: async () => {
+          if (demoMode) {
+            setMyProfile((prev) => {
+              const nextLocked = { ...(prev?.lockedChats || {}) };
+              delete nextLocked[chatId];
+              return { ...prev, lockedChats: nextLocked };
+            });
+            setUnlockedChatIds((prev) => {
+              const next = { ...prev };
+              delete next[chatId];
+              return next;
+            });
+            showAppStatus('Chat lock removed.');
+            return;
+          }
+          if (!db) throw new Error('Firestore is not initialized.');
+          await updateDoc(doc(db, 'users', myProfile.uid), {
+            [`lockedChats.${chatId}`]: deleteField(),
+            updatedAt: serverTimestamp(),
+          });
+          setUnlockedChatIds((prev) => {
+            const next = { ...prev };
+            delete next[chatId];
+            return next;
+          });
+          showAppStatus('Chat lock removed.');
+        },
+      });
+      return;
+    }
+
+    setPinInput('');
+    setPinConfirmInput('');
+    setPinError('');
+    setPinModal({
+      mode: 'create',
+      chatMeta,
+    });
+  };
+
+  const handlePinModalSubmit = async (e) => {
+    e.preventDefault();
+    if (!pinModal || !myProfile) return;
+    const cleanPin = pinInput.replace(/\D/g, '').slice(0, 4);
+
+    if (pinModal.mode === 'unlock') {
+      if (!/^\d{4}$/.test(cleanPin)) {
+        setPinError('Enter your 4-digit numeric PIN.');
+        return;
+      }
+      if (cleanPin !== String(pinModal.expectedPin)) {
+        setPinError('Incorrect PIN. Please try again.');
+        return;
+      }
+      const unlockedId = pinModal.chatMeta.id;
+      const callback = pinModal.onUnlocked;
+      setUnlockedChatIds((prev) => ({ ...prev, [unlockedId]: true }));
+      setPinModal(null);
+      setPinInput('');
+      setPinError('');
+      if (callback) await callback();
+      return;
+    }
+
+    // Create lock PIN
+    const cleanConfirm = pinConfirmInput.replace(/\D/g, '').slice(0, 4);
+    if (!/^\d{4}$/.test(cleanPin)) {
+      setPinError('PIN must be exactly 4 digits.');
+      return;
+    }
+    if (cleanPin !== cleanConfirm) {
+      setPinError('PINs do not match.');
+      return;
+    }
+
+    setPinSaving(true);
+    setPinError('');
     try {
-      if (!demoMode && isFirebaseConfigured && db && !directChatsMap[chatId]) {
+      const chatId = pinModal.chatMeta.id;
+      if (demoMode) {
+        setMyProfile((prev) => ({
+          ...prev,
+          lockedChats: { ...(prev?.lockedChats || {}), [chatId]: cleanPin },
+        }));
+      } else {
+        if (!db) throw new Error('Firestore is not initialized.');
         await setDoc(
-          doc(db, 'chats', chatId),
+          doc(db, 'users', myProfile.uid),
           {
-            participants: [myProfile.uid, peerUser.uid].sort(),
+            lockedChats: { [chatId]: cleanPin },
             updatedAt: serverTimestamp(),
           },
           { merge: true }
         );
       }
-      setSearchResult(null);
-      setSearchInput('');
-      setContactStatusMessage('');
-      setInviteModalUser(null);
-      setActiveChat({ type: 'direct', id: chatId, peerUid: peerUser.uid });
+      setUnlockedChatIds((prev) => ({ ...prev, [chatId]: true }));
+      setPinModal(null);
+      setPinInput('');
+      setPinConfirmInput('');
+      showAppStatus('Chat locked with 4-digit PIN.');
     } catch (err) {
-      showAppError('Open direct chat failed', err);
+      setPinError(formatFirestoreError(err, 'Failed to save chat PIN.'));
+    } finally {
+      setPinSaving(false);
     }
+  };
+
+  const handleClearChat = (chatMeta) => {
+    if (!myProfile || !chatMeta?.id) return;
+    const colName = chatMeta.type === 'group' ? 'groups' : 'chats';
+    setConfirmDialog({
+      title: 'Clear Chat',
+      message: `Clear all visible messages in "${chatMeta.label || 'this chat'}" for you? Other participants will keep their chat history.`,
+      confirmLabel: 'Clear Chat',
+      tone: 'danger',
+      onConfirm: async () => {
+        const nowMs = Date.now();
+        if (demoMode) {
+          if (chatMeta.type === 'group') {
+            setGroups((prev) =>
+              prev.map((g) =>
+                g.id === chatMeta.id
+                  ? { ...g, clearedAt: { ...(g.clearedAt || {}), [myProfile.uid]: nowMs } }
+                  : g
+              )
+            );
+          } else {
+            setDirectChatsMap((prev) => ({
+              ...prev,
+              [chatMeta.id]: {
+                ...(prev[chatMeta.id] || {
+                  id: chatMeta.id,
+                  participants: [myProfile.uid, chatMeta.peerUid].filter(Boolean).sort(),
+                }),
+                clearedAt: { ...(prev[chatMeta.id]?.clearedAt || {}), [myProfile.uid]: nowMs },
+              },
+            }));
+          }
+          showAppStatus('Chat cleared.');
+          return;
+        }
+        if (!db) throw new Error('Firestore is not initialized.');
+        if (chatMeta.type === 'direct' && !directChatsMap[chatMeta.id] && chatMeta.peerUid) {
+          await setDoc(
+            doc(db, 'chats', chatMeta.id),
+            {
+              participants: [myProfile.uid, chatMeta.peerUid].sort(),
+              clearedAt: { [myProfile.uid]: serverTimestamp() },
+              updatedAt: serverTimestamp(),
+            },
+            { merge: true }
+          );
+        } else {
+          await updateDoc(doc(db, colName, chatMeta.id), {
+            [`clearedAt.${myProfile.uid}`]: serverTimestamp(),
+          });
+        }
+        setLocalClearedAtMap((prev) => ({ ...prev, [chatMeta.id]: nowMs }));
+        showAppStatus('Chat cleared.');
+      },
+    });
+  };
+
+  const handleDeleteContact = (peerUser) => {
+    if (!myProfile || !peerUser) return;
+    const targetUid = String(peerUser.uid || peerUser.id || '');
+    if (!targetUid) return;
+    const pairId = getPairId(myProfile.uid, targetUid);
+    const label =
+      peerUser.nickname ||
+      peerUser.displayName ||
+      (peerUser.usernameLower ? `@${peerUser.usernameLower}` : peerUser.email || 'this contact');
+
+    setConfirmDialog({
+      title: 'Delete Contact',
+      message: `Remove ${label} from your contacts and hide this conversation?`,
+      confirmLabel: 'Delete Contact',
+      tone: 'danger',
+      onConfirm: async () => {
+        if (demoMode) {
+          setUserContactsDocs((prev) => prev.filter((c) => c.uid !== targetUid));
+          setContactRequests((prev) =>
+            prev.filter(
+              (r) =>
+                r.id !== pairId &&
+                !((r.from === myProfile.uid && r.to === targetUid) ||
+                  (r.from === targetUid && r.to === myProfile.uid))
+            )
+          );
+          setDirectChatsMap((prev) => ({
+            ...prev,
+            [pairId]: {
+              ...(prev[pairId] || { id: pairId, participants: [myProfile.uid, targetUid].sort() }),
+              hiddenFor: Array.from(new Set([...(prev[pairId]?.hiddenFor || []), myProfile.uid])),
+            },
+          }));
+          if (activeChat?.id === pairId) setActiveChat(null);
+          showAppStatus('Contact deleted.');
+          return;
+        }
+        if (!db) throw new Error('Firestore is not initialized.');
+
+        const matchingReqs = contactRequests.filter((r) => {
+          const fromUid = r.from || r.fromUid;
+          const toUid = r.to || r.toUid;
+          return (
+            r.id === pairId ||
+            (fromUid === myProfile.uid && toUid === targetUid) ||
+            (fromUid === targetUid && toUid === myProfile.uid)
+          );
+        });
+
+        await Promise.all([
+          deleteDoc(doc(db, 'users', myProfile.uid, 'contacts', targetUid)).catch(() => {}),
+          deleteDoc(doc(db, 'users', targetUid, 'contacts', myProfile.uid)).catch(() => {}),
+          ...matchingReqs.map((r) => deleteDoc(doc(db, 'contactRequests', r.id)).catch(() => {})),
+          setDoc(
+            doc(db, 'chats', pairId),
+            {
+              participants: [myProfile.uid, targetUid].sort(),
+              hiddenFor: arrayUnion(myProfile.uid),
+              updatedAt: serverTimestamp(),
+            },
+            { merge: true }
+          ),
+        ]);
+
+        if (activeChat?.id === pairId) setActiveChat(null);
+        showAppStatus('Contact deleted.');
+      },
+    });
+  };
+
+  const handleDeleteMessage = (msg) => {
+    if (!activeChat || !myProfile || !msg?.id) return;
+    const isMine = msg.senderId === myProfile.uid || msg.senderUid === myProfile.uid;
+    if (!isMine && !canBypassLock) return;
+
+    setConfirmDialog({
+      title: 'Delete Message',
+      message: 'Delete this message permanently for everyone in this chat?',
+      confirmLabel: 'Delete',
+      tone: 'danger',
+      onConfirm: async () => {
+        if (demoMode) {
+          setDemoMessagesByChat((prev) => ({
+            ...prev,
+            [activeChat.id]: (prev[activeChat.id] || []).filter((m) => m.id !== msg.id),
+          }));
+          showAppStatus('Message deleted.');
+          return;
+        }
+        if (!db) throw new Error('Firestore is not initialized.');
+        const colName = activeChat.type === 'group' ? 'groups' : 'chats';
+        await deleteDoc(doc(db, colName, activeChat.id, 'messages', msg.id));
+        showAppStatus('Message deleted.');
+      },
+    });
   };
 
   // ---------------------------------------------------------------------------
@@ -2094,6 +2454,25 @@ export default function App() {
   // ---------------------------------------------------------------------------
   const sendMessagePayload = async (payload) => {
     if (!activeChat || !myProfile || myProfile.isBanned) return false;
+
+    const currentGroup =
+      activeChat.type === 'group' ? groups.find((g) => g.id === activeChat.id) : null;
+    const isGroupAdmin = currentGroup ? (currentGroup.admins || []).includes(myProfile.uid) : false;
+    const groupLocked =
+      activeChat.type === 'group' &&
+      Boolean(currentGroup?.permissions?.onlyAdminsSendMessages || currentGroup?.adminOnly) &&
+      !isGroupAdmin &&
+      !canBypassLock;
+    const globalLocked = Boolean(appState.adminOnlyMessaging) && !canBypassLock;
+
+    if (globalLocked || groupLocked) {
+      openModalPopup(
+        'Messaging Locked',
+        'Only Admin, Superadmin, and Owner can send messages right now.',
+        'info'
+      );
+      return false;
+    }
 
     const gate = messageLimiterRef.current();
     if (!gate.allowed) {
@@ -2110,6 +2489,7 @@ export default function App() {
     };
 
     const baseMsg = {
+      senderId: myProfile.uid,
       senderUid: myProfile.uid,
       senderUsername: myProfile.usernameLower || '',
       senderNickname: myProfile.nickname || myProfile.displayName || '',
@@ -2153,6 +2533,16 @@ export default function App() {
 
     try {
       const colName = activeChat.type === 'group' ? 'groups' : 'chats';
+      if (activeChat.type === 'direct' && activeChat.peerUid && !directChatsMap[activeChat.id]) {
+        await setDoc(
+          doc(db, 'chats', activeChat.id),
+          {
+            participants: [myProfile.uid, activeChat.peerUid].sort(),
+            updatedAt: serverTimestamp(),
+          },
+          { merge: true }
+        );
+      }
       await addDoc(collection(db, colName, activeChat.id, 'messages'), {
         ...baseMsg,
         createdAt: serverTimestamp(),
@@ -2160,6 +2550,9 @@ export default function App() {
       await setDoc(
         doc(db, colName, activeChat.id),
         {
+          ...(activeChat.type === 'direct' && activeChat.peerUid
+            ? { participants: [myProfile.uid, activeChat.peerUid].sort() }
+            : {}),
           lastMessage: previewText.slice(0, 140),
           updatedAt: serverTimestamp(),
         },
@@ -2168,6 +2561,11 @@ export default function App() {
       return true;
     } catch (err) {
       showAppError('Send message failed', err);
+      openModalPopup(
+        'Message Failed',
+        formatFirestoreError(err, 'Unable to send message.'),
+        'error'
+      );
       return false;
     }
   };
@@ -2181,13 +2579,17 @@ export default function App() {
   };
 
   const handleSendCallInvite = async () => {
-    if (!appState.allowVideoCalls || myProfile?.isBanned) return;
+    if (!appState.allowVideoCalls || myProfile?.isBanned || !activeChat || !myProfile) return;
     const now = Date.now();
+    const callUrl = `https://meet.jit.si/voliud-${now}`;
     await sendMessagePayload({
       type: 'call_invite',
       text: 'Jitsi Video Call',
       call: {
-        roomUrl: `https://meet.jit.si/voliud-${now}`,
+        callUrl,
+        roomUrl: callUrl,
+        callerId: myProfile.uid,
+        receiverId: activeChat.type === 'direct' ? activeChat.peerUid || '' : '',
         expiresAt: now + 45000,
         status: 'ringing',
       },
@@ -2386,17 +2788,27 @@ export default function App() {
   };
 
   const handleTogglePermission = async (groupId, key, value) => {
+    const patch = {
+      [`permissions.${key}`]: value,
+      ...(key === 'onlyAdminsSendMessages' ? { adminOnly: Boolean(value) } : {}),
+    };
     if (demoMode) {
       setGroups((prev) =>
         prev.map((g) =>
-          g.id === groupId ? { ...g, permissions: { ...g.permissions, [key]: value } } : g
+          g.id === groupId
+            ? {
+                ...g,
+                ...(key === 'onlyAdminsSendMessages' ? { adminOnly: Boolean(value) } : {}),
+                permissions: { ...g.permissions, [key]: value },
+              }
+            : g
         )
       );
       return;
     }
     try {
       await updateDoc(doc(db, 'groups', groupId), {
-        [`permissions.${key}`]: value,
+        ...patch,
         updatedAt: serverTimestamp(),
       });
     } catch (err) {
@@ -2698,6 +3110,20 @@ export default function App() {
     [activeChat, userProfilesMap, acceptedContacts]
   );
 
+  const activeClearedAtMs = useMemo(() => {
+    if (!activeChat || !myProfile?.uid) return 0;
+    const docData =
+      activeChat.type === 'group' ? activeGroup : directChatsMap[activeChat.id];
+    const remoteMs = getMillis(docData?.clearedAt?.[myProfile.uid], 0);
+    const localMs = localClearedAtMap[activeChat.id] || 0;
+    return Math.max(remoteMs, localMs);
+  }, [activeChat, activeGroup, directChatsMap, localClearedAtMap, myProfile?.uid]);
+
+  const visibleMessages = useMemo(() => {
+    if (!activeClearedAtMs) return messages;
+    return messages.filter((m) => (m.createdAtMs || 0) > activeClearedAtMs);
+  }, [messages, activeClearedAtMs]);
+
   const renderContent = () => {
     if (!authReady || profileLoading) {
       return (
@@ -2735,19 +3161,35 @@ export default function App() {
     }
 
     if (activeChat) {
+      const chatLabel =
+        activeChat.type === 'group'
+          ? activeGroup?.name || 'Group Chat'
+          : activePeer?.nickname ||
+            activePeer?.displayName ||
+            (activePeer?.usernameLower ? `@${activePeer.usernameLower}` : 'Chat');
+      const currentChatMeta = {
+        type: activeChat.type,
+        id: activeChat.id,
+        peerUid: activeChat.peerUid,
+        label: chatLabel,
+      };
       return (
         <ChatRoom
           chatType={activeChat.type}
           peer={activePeer}
           group={activeGroup}
           myProfile={myProfile}
-          messages={messages}
+          messages={visibleMessages}
           typingUsers={typingUsers}
           allowVideoCalls={appState.allowVideoCalls}
+          globalAdminOnlyMessaging={appState.adminOnlyMessaging}
+          canBypassLock={canBypassLock}
+          isChatLocked={Boolean(myProfile?.lockedChats?.[activeChat.id])}
           rateLimitNotice={rateLimitNotice}
           onBack={() => setActiveChat(null)}
           onOpenGroupInfo={() => setGroupInfoOpen(true)}
           onSendMessage={handleSendMessage}
+          onDeleteMessage={handleDeleteMessage}
           onSendCallInvite={handleSendCallInvite}
           onRespondCall={handleRespondCall}
           onSendPoll={handleSendPoll}
@@ -2755,6 +3197,9 @@ export default function App() {
           onTypingChange={handleTypingChange}
           onUpdateFamilyData={handleUpdateFamilyData}
           onReportContact={handleReportContact}
+          onClearChat={() => handleClearChat(currentChatMeta)}
+          onDeleteContact={handleDeleteContact}
+          onToggleChatLock={() => handleToggleChatLock(currentChatMeta)}
         />
       );
     }
@@ -2964,46 +3409,108 @@ export default function App() {
 
           {/* Groups Section */}
           {(activeTab === 'all' || activeTab === 'groups') &&
-            filteredGroups.map((g) => (
-              <Tilt3DCard
-                key={g.id}
-                intensity={4}
-                onClick={() => setActiveChat({ type: 'group', id: g.id })}
-                className="cursor-pointer rounded-2xl border border-white/14 bg-[#0D0D0D] p-3.5 shadow-spatial-card hover:border-white/30 transition"
-              >
-                <div className="flex items-center justify-between gap-3">
-                  <div className="flex items-center gap-3 min-w-0">
-                    <div className="flex h-11 w-11 shrink-0 items-center justify-center rounded-2xl border border-white/20 bg-[#161616] text-white">
-                      {g.familyMode ? <Home className="h-4 w-4" /> : <Users className="h-4 w-4" />}
-                    </div>
-                    <div className="min-w-0">
-                      <div className="flex items-center gap-2">
-                        <span className="truncate text-sm font-semibold text-white">
-                          {g.name}
-                        </span>
-                        {g.familyMode && (
-                          <span className="shrink-0 rounded-full border border-white/25 bg-white/10 px-2 py-0.5 text-[9px] font-semibold uppercase tracking-wider text-white">
-                            Family
-                          </span>
-                        )}
+            filteredGroups.map((g) => {
+              const isLocked = Boolean(myProfile?.lockedChats?.[g.id]);
+              const clearedMs = Math.max(
+                getMillis(g.clearedAt?.[myProfile.uid], 0),
+                localClearedAtMap[g.id] || 0
+              );
+              const updatedMs = getMillis(g.updatedAt, g.updatedAtMs);
+              const showSnippet = g.lastMessage && (!clearedMs || updatedMs > clearedMs);
+              const groupMeta = { type: 'group', id: g.id, label: g.name || 'Group' };
+              return (
+                <Tilt3DCard
+                  key={g.id}
+                  intensity={4}
+                  onClick={() => openGroupChat(g)}
+                  className="cursor-pointer rounded-2xl border border-white/14 bg-[#0D0D0D] p-3.5 shadow-spatial-card hover:border-white/30 transition"
+                >
+                  <div className="flex items-center justify-between gap-2.5">
+                    <div className="flex items-center gap-3 min-w-0">
+                      <div className="flex h-11 w-11 shrink-0 items-center justify-center rounded-2xl border border-white/20 bg-[#161616] text-white">
+                        {g.familyMode ? <Home className="h-4 w-4" /> : <Users className="h-4 w-4" />}
                       </div>
-                      <p className="mt-0.5 truncate text-xs text-white/50">
-                        {g.lastMessage || `${(g.members || []).length} members`}
-                      </p>
+                      <div className="min-w-0">
+                        <div className="flex items-center gap-1.5">
+                          <span className="truncate text-sm font-semibold text-white">
+                            {g.name}
+                          </span>
+                          {isLocked && (
+                            <span
+                              className="inline-flex shrink-0 items-center gap-0.5 rounded-full border border-white/25 bg-white/10 px-1.5 py-0.5 text-[9px] font-semibold uppercase tracking-wider text-white"
+                              title="Locked with PIN"
+                            >
+                              <Lock className="h-2.5 w-2.5" />
+                            </span>
+                          )}
+                          {g.familyMode && (
+                            <span className="shrink-0 rounded-full border border-white/25 bg-white/10 px-2 py-0.5 text-[9px] font-semibold uppercase tracking-wider text-white">
+                              Family
+                            </span>
+                          )}
+                        </div>
+                        <p className="mt-0.5 truncate text-xs text-white/50">
+                          {isLocked && !unlockedChatIds[g.id]
+                            ? 'Locked chat • Tap to enter PIN'
+                            : showSnippet
+                            ? g.lastMessage
+                            : `${(g.members || []).length} members`}
+                        </p>
+                      </div>
+                    </div>
+                    <div
+                      className="flex items-center gap-1 shrink-0"
+                      onClick={(e) => e.stopPropagation()}
+                    >
+                      <button
+                        type="button"
+                        onClick={() => handleToggleChatLock(groupMeta)}
+                        className="flex h-7 w-7 items-center justify-center rounded-full border border-white/12 bg-[#161616] text-white/55 hover:border-white/35 hover:text-white transition"
+                        title={isLocked ? 'Unlock / Remove Lock' : 'Lock Chat'}
+                        aria-label={isLocked ? 'Unlock / Remove Lock' : 'Lock Chat'}
+                      >
+                        {isLocked ? <Unlock className="h-3.5 w-3.5" /> : <Lock className="h-3.5 w-3.5" />}
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => handleClearChat(groupMeta)}
+                        className="flex h-7 w-7 items-center justify-center rounded-full border border-white/12 bg-[#161616] text-white/55 hover:border-white/35 hover:text-white transition"
+                        title="Clear Chat"
+                        aria-label="Clear Group Chat"
+                      >
+                        <Trash2 className="h-3.5 w-3.5" />
+                      </button>
+                      <span className="ml-0.5 font-mono text-[10px] text-white/35">
+                        {(g.members || []).length}p
+                      </span>
                     </div>
                   </div>
-                  <span className="shrink-0 font-mono text-[10px] text-white/35">
-                    {(g.members || []).length}p
-                  </span>
-                </div>
-              </Tilt3DCard>
-            ))}
+                </Tilt3DCard>
+              );
+            })}
 
           {/* Direct Mutual Contacts Section */}
           {(activeTab === 'all' || activeTab === 'direct') &&
             filteredContacts.map((contact) => {
               const pairId = getPairId(myProfile.uid, contact.uid);
               const chatDoc = directChatsMap[pairId];
+              const isLocked = Boolean(myProfile?.lockedChats?.[pairId]);
+              const clearedMs = Math.max(
+                getMillis(chatDoc?.clearedAt?.[myProfile.uid], 0),
+                localClearedAtMap[pairId] || 0
+              );
+              const updatedMs = getMillis(chatDoc?.updatedAt, chatDoc?.updatedAtMs);
+              const showSnippet = chatDoc?.lastMessage && (!clearedMs || updatedMs > clearedMs);
+              const contactLabel =
+                contact.nickname ||
+                contact.displayName ||
+                (contact.usernameLower ? `@${contact.usernameLower}` : contact.email || 'Contact');
+              const chatMeta = {
+                type: 'direct',
+                id: pairId,
+                peerUid: contact.uid,
+                label: contactLabel,
+              };
               const hasNote =
                 contact.statusNote &&
                 contact.statusExpiresAt &&
@@ -3016,11 +3523,11 @@ export default function App() {
                   onClick={() => openDirectChat(contact)}
                   className="cursor-pointer rounded-2xl border border-white/14 bg-[#0D0D0D] p-3.5 shadow-spatial-card hover:border-white/30 transition"
                 >
-                  <div className="flex items-center justify-between gap-3">
+                  <div className="flex items-center justify-between gap-2.5">
                     <div className="flex items-center gap-3 min-w-0">
                       <AvatarRing3D
                         src={contact.photoURL}
-                        name={contact.nickname || contact.displayName || contact.usernameLower || contact.email}
+                        name={contactLabel}
                         status={contact.status || 'Online'}
                         size={42}
                         animated={false}
@@ -3028,8 +3535,16 @@ export default function App() {
                       <div className="min-w-0">
                         <div className="flex items-center gap-1.5">
                           <span className="truncate text-sm font-semibold text-white">
-                            {contact.nickname || contact.displayName || (contact.usernameLower ? `@${contact.usernameLower}` : contact.email)}
+                            {contactLabel}
                           </span>
+                          {isLocked && (
+                            <span
+                              className="inline-flex shrink-0 items-center rounded-full border border-white/25 bg-white/10 px-1.5 py-0.5 text-[9px] text-white"
+                              title="Locked with PIN"
+                            >
+                              <Lock className="h-2.5 w-2.5" />
+                            </span>
+                          )}
                           {contact.badge && (
                             <span className="shrink-0 rounded-full border border-white/25 bg-white/10 px-1.5 py-0.5 font-mono text-[8.5px] font-semibold uppercase tracking-wider text-white">
                               {contact.badge}
@@ -3040,7 +3555,9 @@ export default function App() {
                           </span>
                         </div>
                         <p className="mt-0.5 truncate text-xs text-white/55">
-                          {chatDoc?.lastMessage
+                          {isLocked && !unlockedChatIds[pairId]
+                            ? 'Locked chat • Tap to enter PIN'
+                            : showSnippet
                             ? chatDoc.lastMessage
                             : hasNote
                             ? `“${contact.statusNote}”`
@@ -3049,7 +3566,37 @@ export default function App() {
                       </div>
                     </div>
 
-                    <div className="flex items-center gap-1.5 shrink-0">
+                    <div
+                      className="flex items-center gap-1.5 shrink-0"
+                      onClick={(e) => e.stopPropagation()}
+                    >
+                      <button
+                        type="button"
+                        onClick={() => handleToggleChatLock(chatMeta)}
+                        className="flex h-7 w-7 items-center justify-center rounded-full border border-white/12 bg-[#161616] text-white/55 hover:border-white/35 hover:text-white transition"
+                        title={isLocked ? 'Unlock / Remove Lock' : 'Lock Chat'}
+                        aria-label={isLocked ? 'Unlock / Remove Lock' : 'Lock Chat'}
+                      >
+                        {isLocked ? <Unlock className="h-3.5 w-3.5" /> : <Lock className="h-3.5 w-3.5" />}
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => handleClearChat(chatMeta)}
+                        className="flex h-7 w-7 items-center justify-center rounded-full border border-white/12 bg-[#161616] text-white/55 hover:border-white/35 hover:text-white transition"
+                        title="Clear Chat"
+                        aria-label="Clear Chat"
+                      >
+                        <Trash2 className="h-3.5 w-3.5" />
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => handleDeleteContact(contact)}
+                        className="flex h-7 w-7 items-center justify-center rounded-full border border-white/12 bg-[#161616] text-white/55 hover:border-red-400/50 hover:text-red-300 transition"
+                        title="Delete Contact"
+                        aria-label="Delete Contact"
+                      >
+                        <UserX className="h-3.5 w-3.5" />
+                      </button>
                       <StatusDot status={contact.status || 'Online'} />
                     </div>
                   </div>
@@ -3470,6 +4017,37 @@ export default function App() {
                         <span
                           className={`h-5 w-5 rounded-full ${
                             appState.allowVideoCalls ? 'bg-black' : 'bg-white/80'
+                          }`}
+                        />
+                      </div>
+                    </button>
+
+                    <button
+                      type="button"
+                      onClick={() =>
+                        handleToggleAppFeature('adminOnlyMessaging', !appState.adminOnlyMessaging)
+                      }
+                      className="flex w-full items-center justify-between rounded-xl border border-white/14 bg-[#121212] px-3.5 py-2.5 text-left"
+                    >
+                      <div className="flex items-center gap-2.5 pr-3">
+                        <Lock className="h-4 w-4 text-white/80 shrink-0" />
+                        <div>
+                          <div className="text-xs font-semibold text-white">
+                            Only Admin / Superadmin / Owner Can Message
+                          </div>
+                          <div className="text-[10.5px] text-white/45">
+                            Restricts sending messages across all chats to privileged roles
+                          </div>
+                        </div>
+                      </div>
+                      <div
+                        className={`flex h-6 w-11 shrink-0 items-center rounded-full p-0.5 transition ${
+                          appState.adminOnlyMessaging ? 'bg-white justify-end' : 'bg-white/20 justify-start'
+                        }`}
+                      >
+                        <span
+                          className={`h-5 w-5 rounded-full ${
+                            appState.adminOnlyMessaging ? 'bg-black' : 'bg-white/80'
                           }`}
                         />
                       </div>
@@ -3924,14 +4502,200 @@ export default function App() {
             onClose={() => setGroupInfoOpen(false)}
             group={activeGroup}
             myUid={myProfile?.uid}
+            canGlobalBypass={canBypassLock}
+            isChatLocked={Boolean(activeGroup && myProfile?.lockedChats?.[activeGroup.id])}
             memberProfiles={userProfilesMap}
             acceptedContacts={acceptedContacts}
             onUpdateGroupName={handleUpdateGroupName}
             onTogglePermission={handleTogglePermission}
             onAddMember={handleAddGroupMember}
             onPromoteAdmin={handlePromoteAdmin}
+            onClearGroupChat={(grp) => {
+              setGroupInfoOpen(false);
+              handleClearChat({ type: 'group', id: grp.id, label: grp.name || 'Group' });
+            }}
+            onToggleChatLock={(grp) => {
+              setGroupInfoOpen(false);
+              handleToggleChatLock({ type: 'group', id: grp.id, label: grp.name || 'Group' });
+            }}
             onExitGroup={handleExitGroup}
           />
+        )}
+
+        {/* 4-Digit Chat Lock PIN Modal (Create / Unlock) */}
+        {pinModal && (
+          <div
+            className="fixed inset-0 z-[85] flex items-center justify-center bg-black/85 px-5 backdrop-blur-md"
+            onClick={() => !pinSaving && setPinModal(null)}
+          >
+            <form
+              onSubmit={handlePinModalSubmit}
+              onClick={(e) => e.stopPropagation()}
+              role="dialog"
+              aria-modal="true"
+              className="animate-card-3d-in w-full max-w-[380px] rounded-3xl border border-white/25 bg-[#0D0D0D] p-5 shadow-spatial-card space-y-4"
+            >
+              <div className="flex items-center justify-between gap-2">
+                <div className="flex items-center gap-2">
+                  <Lock className="h-4 w-4 text-white" />
+                  <h3 className="text-base font-semibold text-white">
+                    {pinModal.mode === 'unlock' ? 'Enter Chat PIN' : 'Lock Chat with PIN'}
+                  </h3>
+                </div>
+                <button
+                  type="button"
+                  disabled={pinSaving}
+                  onClick={() => setPinModal(null)}
+                  className="flex h-8 w-8 items-center justify-center rounded-full border border-white/15 bg-[#161616] text-white/70 hover:text-white transition"
+                  aria-label="Close PIN modal"
+                >
+                  <X className="h-4 w-4" />
+                </button>
+              </div>
+
+              <p className="text-xs text-white/65">
+                {pinModal.mode === 'unlock'
+                  ? `Enter your 4-digit PIN to open "${pinModal.chatMeta?.label || 'this chat'}".`
+                  : `Set a 4-digit numeric PIN to protect "${pinModal.chatMeta?.label || 'this chat'}" on your account.`}
+              </p>
+
+              <div className="space-y-3">
+                <div>
+                  <label className="block text-[10.5px] font-semibold uppercase tracking-wider text-white/50">
+                    4-Digit PIN
+                  </label>
+                  <input
+                    type="password"
+                    inputMode="numeric"
+                    maxLength={4}
+                    autoFocus
+                    value={pinInput}
+                    onChange={(e) => {
+                      setPinInput(e.target.value.replace(/\D/g, '').slice(0, 4));
+                      setPinError('');
+                    }}
+                    placeholder="••••"
+                    className="mt-1.5 w-full rounded-2xl border border-white/20 bg-black px-4 py-3 text-center font-mono text-lg tracking-[0.6em] text-white placeholder:text-white/25 focus:border-white focus:outline-none"
+                  />
+                </div>
+
+                {pinModal.mode === 'create' && (
+                  <div>
+                    <label className="block text-[10.5px] font-semibold uppercase tracking-wider text-white/50">
+                      Confirm 4-Digit PIN
+                    </label>
+                    <input
+                      type="password"
+                      inputMode="numeric"
+                      maxLength={4}
+                      value={pinConfirmInput}
+                      onChange={(e) => {
+                        setPinConfirmInput(e.target.value.replace(/\D/g, '').slice(0, 4));
+                        setPinError('');
+                      }}
+                      placeholder="••••"
+                      className="mt-1.5 w-full rounded-2xl border border-white/20 bg-black px-4 py-3 text-center font-mono text-lg tracking-[0.6em] text-white placeholder:text-white/25 focus:border-white focus:outline-none"
+                    />
+                  </div>
+                )}
+              </div>
+
+              {pinError && (
+                <div className="rounded-xl border border-red-500/40 bg-red-950/50 px-3 py-2 text-xs text-red-200">
+                  {pinError}
+                </div>
+              )}
+
+              <div className="flex items-center justify-end gap-2 pt-1">
+                <button
+                  type="button"
+                  disabled={pinSaving}
+                  onClick={() => setPinModal(null)}
+                  className="rounded-xl border border-white/18 bg-[#161616] px-4 py-2 text-xs font-medium text-white/80 hover:text-white transition"
+                >
+                  Cancel
+                </button>
+                <button
+                  type="submit"
+                  disabled={pinSaving}
+                  className="rounded-xl bg-white px-4 py-2 text-xs font-semibold text-black shadow-spatial-white transition active:scale-95 disabled:opacity-50"
+                >
+                  {pinSaving
+                    ? 'Saving...'
+                    : pinModal.mode === 'unlock'
+                    ? 'Unlock Chat'
+                    : 'Save PIN Lock'}
+                </button>
+              </div>
+            </form>
+          </div>
+        )}
+
+        {/* Custom Confirmation Modal (Clear Chat / Delete Contact / Delete Message / Unlock) */}
+        {confirmDialog && (
+          <div
+            className="fixed inset-0 z-[90] flex items-center justify-center bg-black/85 px-5 backdrop-blur-md"
+            onClick={() => !confirmBusy && setConfirmDialog(null)}
+          >
+            <div
+              onClick={(e) => e.stopPropagation()}
+              role="dialog"
+              aria-modal="true"
+              className="animate-card-3d-in w-full max-w-[380px] rounded-3xl border border-white/25 bg-[#0D0D0D] p-5 shadow-spatial-card space-y-4"
+            >
+              <div className="flex items-center gap-2.5">
+                <AlertTriangle
+                  className={`h-5 w-5 shrink-0 ${
+                    confirmDialog.tone === 'danger' ? 'text-red-400' : 'text-white'
+                  }`}
+                />
+                <h3 className="text-base font-semibold text-white">{confirmDialog.title}</h3>
+              </div>
+
+              <p className="text-xs leading-relaxed text-white/80 break-words">
+                {confirmDialog.message}
+              </p>
+
+              <div className="flex items-center justify-end gap-2 pt-1">
+                <button
+                  type="button"
+                  disabled={confirmBusy}
+                  onClick={() => setConfirmDialog(null)}
+                  className="rounded-xl border border-white/18 bg-[#161616] px-4 py-2 text-xs font-medium text-white/80 hover:text-white transition"
+                >
+                  Cancel
+                </button>
+                <button
+                  type="button"
+                  disabled={confirmBusy}
+                  onClick={async () => {
+                    if (confirmBusy) return;
+                    setConfirmBusy(true);
+                    try {
+                      await confirmDialog.onConfirm();
+                      setConfirmDialog(null);
+                    } catch (err) {
+                      setConfirmDialog(null);
+                      openModalPopup(
+                        'Action Failed',
+                        formatFirestoreError(err, 'Unable to complete action.'),
+                        'error'
+                      );
+                    } finally {
+                      setConfirmBusy(false);
+                    }
+                  }}
+                  className={`rounded-xl px-4 py-2 text-xs font-semibold transition active:scale-95 disabled:opacity-50 ${
+                    confirmDialog.tone === 'danger'
+                      ? 'bg-red-600 text-white hover:bg-red-500'
+                      : 'bg-white text-black shadow-spatial-white'
+                  }`}
+                >
+                  {confirmBusy ? 'Working...' : confirmDialog.confirmLabel || 'Confirm'}
+                </button>
+              </div>
+            </div>
+          </div>
         )}
       </div>
     </div>

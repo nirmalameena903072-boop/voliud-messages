@@ -7,6 +7,8 @@ import {
   LogOut,
   Plus,
   Shield,
+  Trash2,
+  Unlock,
   Users,
   X,
 } from 'lucide-react';
@@ -230,12 +232,16 @@ export function GroupInfoDrawer({
   onClose,
   group,
   myUid,
+  canGlobalBypass = false,
+  isChatLocked = false,
   memberProfiles,
   acceptedContacts,
   onUpdateGroupName,
   onTogglePermission,
   onAddMember,
   onPromoteAdmin,
+  onClearGroupChat,
+  onToggleChatLock,
   onExitGroup,
 }) {
   const [groupName, setGroupName] = useState(group?.name || '');
@@ -252,12 +258,13 @@ export function GroupInfoDrawer({
 
   const admins = group.admins || [];
   const members = group.members || [];
-  const isAdmin = admins.includes(myUid);
+  const isAdmin = admins.includes(myUid) || canGlobalBypass;
   const perms = group.permissions || {
     onlyAdminsEditInfo: false,
     onlyAdminsSendMessages: false,
     onlyAdminsAddMembers: false,
   };
+  const adminOnlyActive = Boolean(perms.onlyAdminsSendMessages || group.adminOnly);
 
   const canEditInfo = !perms.onlyAdminsEditInfo || isAdmin;
   const canAddMembers = !perms.onlyAdminsAddMembers || isAdmin;
@@ -368,7 +375,8 @@ export function GroupInfoDrawer({
           </div>
           <div className="mt-2 space-y-2">
             {permissionItems.map((item) => {
-              const enabled = !!perms[item.key];
+              const enabled =
+                item.key === 'onlyAdminsSendMessages' ? adminOnlyActive : !!perms[item.key];
               return (
                 <button
                   key={item.key}
@@ -476,6 +484,32 @@ export function GroupInfoDrawer({
                 </button>
               ))}
             </div>
+          </div>
+        )}
+
+        {/* Chat Privacy & History Actions */}
+        {(onToggleChatLock || onClearGroupChat) && (
+          <div className="mt-6 grid grid-cols-2 gap-2.5">
+            {onToggleChatLock && (
+              <button
+                type="button"
+                onClick={() => onToggleChatLock(group)}
+                className="flex items-center justify-center gap-1.5 rounded-2xl border border-white/18 bg-[#161616] px-3 py-2.5 text-xs font-semibold text-white hover:border-white/40 transition"
+              >
+                {isChatLocked ? <Unlock className="h-3.5 w-3.5" /> : <Lock className="h-3.5 w-3.5" />}
+                <span>{isChatLocked ? 'Unlock / Remove Lock' : 'Lock Chat'}</span>
+              </button>
+            )}
+            {onClearGroupChat && (
+              <button
+                type="button"
+                onClick={() => onClearGroupChat(group)}
+                className="flex items-center justify-center gap-1.5 rounded-2xl border border-white/18 bg-[#161616] px-3 py-2.5 text-xs font-semibold text-white/85 hover:border-red-400/50 hover:text-red-200 transition"
+              >
+                <Trash2 className="h-3.5 w-3.5" />
+                <span>Clear Chat</span>
+              </button>
+            )}
           </div>
         )}
 

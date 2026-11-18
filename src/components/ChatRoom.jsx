@@ -16,6 +16,8 @@ import {
   Send,
   StickyNote,
   Trash2,
+  Unlock,
+  UserX,
   Video,
   X,
 } from 'lucide-react';
@@ -30,12 +32,16 @@ import { AvatarRing3D, StatusDot, Tilt3DCard, TypingWave3D } from './Spatial3D';
 
 function CallInviteCard({ msg, isMine, now, onRespondCall }) {
   const call = msg.call || {};
-  const safeRoomUrl = sanitizeExternalUrl(call.roomUrl, ['meet.jit.si']);
+  const safeRoomUrl = sanitizeExternalUrl(call.callUrl || call.roomUrl, ['meet.jit.si']);
   const expiresAt = call.expiresAt || 0;
   const remainingMs = Math.max(0, expiresAt - now);
   const remainingSec = Math.ceil(remainingMs / 1000);
   const isExpired = now > expiresAt && call.status === 'ringing';
   const effectiveStatus = isExpired ? 'expired' : call.status || 'ringing';
+  const isEnded =
+    effectiveStatus === 'expired' ||
+    effectiveStatus === 'declined' ||
+    effectiveStatus === 'cancelled';
 
   const handleAccept = () => {
     if (safeRoomUrl) {
@@ -49,7 +55,7 @@ function CallInviteCard({ msg, isMine, now, onRespondCall }) {
       intensity={7}
       key={`${msg.id}-${effectiveStatus}`}
       className={`animate-call-flip w-[265px] max-w-full rounded-3xl border p-4 ${
-        effectiveStatus === 'expired' || effectiveStatus === 'declined'
+        isEnded
           ? 'border-white/14 bg-[#0D0D0D] text-white/70 shadow-spatial-card'
           : isMine
           ? 'border-white/30 bg-white text-black shadow-spatial-white'
@@ -59,14 +65,14 @@ function CallInviteCard({ msg, isMine, now, onRespondCall }) {
       <div className="flex items-center justify-between">
         <span
           className={`inline-flex items-center gap-1.5 text-[10px] font-bold uppercase tracking-[0.18em] ${
-            effectiveStatus === 'expired' || effectiveStatus === 'declined'
+            isEnded
               ? 'text-white/45'
               : isMine
               ? 'text-black/60'
               : 'text-white/60'
           }`}
         >
-          {effectiveStatus === 'expired' || effectiveStatus === 'declined' ? (
+          {isEnded ? (
             <PhoneOff className="h-3.5 w-3.5" />
           ) : (
             <Video className="h-3.5 w-3.5" />
@@ -86,14 +92,16 @@ function CallInviteCard({ msg, isMine, now, onRespondCall }) {
       </div>
 
       <div className="mt-2.5 text-sm font-semibold leading-snug">
-        {effectiveStatus === 'expired'
+        {effectiveStatus === 'cancelled'
+          ? 'Call Cancelled'
+          : effectiveStatus === 'expired'
           ? 'Call Cancelled — No response'
           : effectiveStatus === 'declined'
           ? 'Call Declined'
           : effectiveStatus === 'accepted'
           ? 'Call Connected'
           : isMine
-          ? 'Ringing recipient...'
+          ? 'Calling...'
           : `${msg.senderNickname || `@${msg.senderUsername}`} invites you`}
       </div>
 
@@ -131,12 +139,24 @@ function CallInviteCard({ msg, isMine, now, onRespondCall }) {
               </button>
             </div>
           ) : (
-            <div className="mt-3 flex items-center justify-between gap-2">
-              <span className="text-[11px] opacity-65">Expires automatically at 0s</span>
+            <div className="mt-3.5 grid grid-cols-2 gap-2">
+              {safeRoomUrl ? (
+                <a
+                  href={safeRoomUrl}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="flex items-center justify-center gap-1 rounded-xl bg-black py-2 text-xs font-semibold text-white transition hover:bg-black/85 active:scale-95"
+                >
+                  <Video className="h-3.5 w-3.5" />
+                  <span>Join</span>
+                </a>
+              ) : (
+                <span className="flex items-center justify-center text-[11px] opacity-65">Ringing...</span>
+              )}
               <button
                 type="button"
-                onClick={() => onRespondCall(msg.id, 'declined')}
-                className="rounded-lg border border-black/20 px-2.5 py-1 text-[11px] font-medium hover:bg-black/10"
+                onClick={() => onRespondCall(msg.id, 'cancelled')}
+                className="rounded-xl border border-black/25 px-2.5 py-2 text-xs font-semibold text-black hover:bg-black/10 transition"
               >
                 Cancel
               </button>
@@ -247,10 +267,12 @@ function MessageBubble({
   msg,
   index,
   isMine,
+  canDelete,
   isGroup,
   myUid,
   now,
   onReply,
+  onDeleteMessage,
   onRespondCall,
   onVotePoll,
 }) {
@@ -343,16 +365,29 @@ function MessageBubble({
           </div>
         )}
 
-        {/* Tap-to-Reply icon */}
-        <button
-          type="button"
-          onClick={() => onReply(msg)}
-          className="mb-1 flex h-7 w-7 shrink-0 items-center justify-center rounded-full border border-white/10 bg-[#121212] text-white/45 opacity-70 hover:border-white/30 hover:text-white hover:opacity-100 md:opacity-0 md:group-hover:opacity-100 transition"
-          title="Reply"
-          aria-label="Reply to message"
-        >
-          <CornerUpLeft className="h-3.5 w-3.5" />
-        </button>
+        {/* Action buttons: Reply + Delete/Unsend */}
+        <div className="mb-1 flex shrink-0 items-center gap-1 opacity-75 md:opacity-0 md:group-hover:opacity-100 transition">
+          <button
+            type="button"
+            onClick={() => onReply(msg)}
+            className="flex h-7 w-7 items-center justify-center rounded-full border border-white/10 bg-[#121212] text-white/45 hover:border-white/30 hover:text-white transition"
+            title="Reply"
+            aria-label="Reply to message"
+          >
+            <CornerUpLeft className="h-3.5 w-3.5" />
+          </button>
+          {canDelete && onDeleteMessage && (
+            <button
+              type="button"
+              onClick={() => onDeleteMessage(msg)}
+              className="flex h-7 w-7 items-center justify-center rounded-full border border-white/10 bg-[#121212] text-white/45 hover:border-red-500/40 hover:text-red-400 transition"
+              title="Delete message"
+              aria-label="Delete message"
+            >
+              <Trash2 className="h-3.5 w-3.5" />
+            </button>
+          )}
+        </div>
       </div>
 
       {timeStr && (
@@ -372,10 +407,14 @@ export function ChatRoom({
   messages,
   typingUsers,
   allowVideoCalls = true,
+  globalAdminOnlyMessaging = false,
+  canBypassLock = false,
+  isChatLocked = false,
   rateLimitNotice = '',
   onBack,
   onOpenGroupInfo,
   onSendMessage,
+  onDeleteMessage,
   onSendCallInvite,
   onRespondCall,
   onSendPoll,
@@ -383,6 +422,9 @@ export function ChatRoom({
   onTypingChange,
   onUpdateFamilyData,
   onReportContact,
+  onClearChat,
+  onDeleteContact,
+  onToggleChatLock,
 }) {
   const [text, setText] = useState('');
   const [replyTo, setReplyTo] = useState(null);
@@ -406,9 +448,12 @@ export function ChatRoom({
   const isGroup = chatType === 'group';
   const myUid = myProfile.uid;
   const isBanned = Boolean(myProfile?.isBanned);
-  const isAdmin = isGroup ? (group?.admins || []).includes(myUid) : false;
-  const groupSendLocked = isGroup && group?.permissions?.onlyAdminsSendMessages && !isAdmin;
-  const sendLocked = isBanned || groupSendLocked;
+  const isGroupAdmin = isGroup ? (group?.admins || []).includes(myUid) : false;
+  const groupAdminOnly =
+    isGroup && Boolean(group?.permissions?.onlyAdminsSendMessages || group?.adminOnly);
+  const globalLockBlocked = Boolean(globalAdminOnlyMessaging) && !canBypassLock;
+  const groupSendLocked = groupAdminOnly && !isGroupAdmin && !canBypassLock;
+  const sendLocked = isBanned || globalLockBlocked || groupSendLocked;
 
   // Live clock tick when any ringing call invite exists
   const hasRingingCall = messages.some(
@@ -770,23 +815,29 @@ export function ChatRoom({
             </div>
           </div>
         ) : (
-          messages.map((msg, idx) => (
-            <MessageBubble
-              key={msg.id}
-              msg={msg}
-              index={idx}
-              isMine={msg.senderUid === myUid}
-              isGroup={isGroup}
-              myUid={myUid}
-              now={now}
-              onReply={(m) => {
-                setReplyTo(m);
-                inputRef.current?.focus();
-              }}
-              onRespondCall={onRespondCall}
-              onVotePoll={onVotePoll}
-            />
-          ))
+          messages.map((msg, idx) => {
+            const isMine = msg.senderId === myUid || msg.senderUid === myUid;
+            const canDelete = isMine || canBypassLock;
+            return (
+              <MessageBubble
+                key={msg.id}
+                msg={msg}
+                index={idx}
+                isMine={isMine}
+                canDelete={canDelete}
+                isGroup={isGroup}
+                myUid={myUid}
+                now={now}
+                onReply={(m) => {
+                  setReplyTo(m);
+                  inputRef.current?.focus();
+                }}
+                onDeleteMessage={onDeleteMessage}
+                onRespondCall={onRespondCall}
+                onVotePoll={onVotePoll}
+              />
+            );
+          })
         )}
 
         {/* Real-time 3-Sphere 3D Sine-Wave Typing Indicator */}
@@ -909,12 +960,12 @@ export function ChatRoom({
       {/* Composer */}
       <footer className="shrink-0 border-t border-white/14 bg-[#080808] px-3 py-2.5 pb-[max(0.625rem,env(safe-area-inset-bottom))]">
         {sendLocked ? (
-          <div className="flex items-center justify-center gap-2 rounded-2xl border border-white/14 bg-[#121212] py-3 text-xs text-white/55">
-            <Lock className="h-3.5 w-3.5" />
+          <div className="flex items-center justify-center gap-2 rounded-2xl border border-white/14 bg-[#121212] px-3 py-3 text-center text-xs text-white/65">
+            <Lock className="h-3.5 w-3.5 shrink-0" />
             <span>
               {isBanned
                 ? 'Your account is restricted from sending messages.'
-                : 'Only group admins can send messages.'}
+                : 'Only Admin, Superadmin, and Owner can send messages right now.'}
             </span>
           </div>
         ) : (
@@ -1017,6 +1068,52 @@ export function ChatRoom({
             </div>
 
             <div className="mt-5 flex flex-col gap-2">
+              {onToggleChatLock && (
+                <button
+                  type="button"
+                  onClick={() => {
+                    setContactInfoOpen(false);
+                    onToggleChatLock();
+                  }}
+                  className="flex w-full items-center justify-center gap-2 rounded-2xl border border-white/20 bg-[#161616] py-2.5 text-xs font-semibold text-white hover:border-white/40 transition active:scale-[0.98]"
+                >
+                  {isChatLocked ? (
+                    <Unlock className="h-3.5 w-3.5" />
+                  ) : (
+                    <Lock className="h-3.5 w-3.5" />
+                  )}
+                  <span>{isChatLocked ? 'Unlock / Remove Lock' : 'Lock Chat'}</span>
+                </button>
+              )}
+
+              {onClearChat && (
+                <button
+                  type="button"
+                  onClick={() => {
+                    setContactInfoOpen(false);
+                    onClearChat();
+                  }}
+                  className="flex w-full items-center justify-center gap-2 rounded-2xl border border-white/18 bg-[#161616] py-2.5 text-xs font-semibold text-white/90 hover:border-white/40 transition active:scale-[0.98]"
+                >
+                  <Trash2 className="h-3.5 w-3.5" />
+                  <span>Clear Chat</span>
+                </button>
+              )}
+
+              {onDeleteContact && (
+                <button
+                  type="button"
+                  onClick={() => {
+                    setContactInfoOpen(false);
+                    onDeleteContact(peer);
+                  }}
+                  className="flex w-full items-center justify-center gap-2 rounded-2xl border border-red-500/40 bg-red-950/50 py-2.5 text-xs font-semibold text-red-200 hover:bg-red-900/60 transition active:scale-[0.98]"
+                >
+                  <UserX className="h-3.5 w-3.5" />
+                  <span>Delete Contact</span>
+                </button>
+              )}
+
               <button
                 type="button"
                 onClick={() => {
