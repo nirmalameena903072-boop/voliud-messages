@@ -1739,20 +1739,26 @@ export default function App() {
   };
 
   const handleAddContact = async (targetUser) => {
-    const currentUid = String(authUser?.uid || myProfile?.uid || '');
-    const targetUid = String(targetUser?.uid || targetUser?.id || '');
+    const currentUid = authUser?.uid || myProfile?.uid;
+    const targetUid = targetUser?.uid || targetUser?.id;
+
+    // Immediately open visible custom modal popup so it never fails silently
+    openModalPopup('Contact Request', 'Verifying user details...', 'loading');
+
+    // Step 1: Verify sender and target UIDs exist
     if (!currentUid || !targetUid) {
-      const failMsg = 'Unable to resolve user ID for contact request.';
-      setSearchError(failMsg);
-      setContactStatusMessage(failMsg);
-      openModalPopup('Request Failed', failMsg, 'error');
+      const missingMsg = 'Error: Missing sender or target UID';
+      setSearchError(missingMsg);
+      setContactStatusMessage(missingMsg);
+      openModalPopup('Request Failed', missingMsg, 'error');
       return;
     }
 
     if (targetUid === currentUid) {
-      setSearchError('You cannot add yourself.');
-      setContactStatusMessage('You cannot add yourself.');
-      openModalPopup('Action Not Allowed', 'You cannot send a contact request to yourself.', 'error');
+      const selfMsg = 'You cannot send a contact request to yourself.';
+      setSearchError(selfMsg);
+      setContactStatusMessage(selfMsg);
+      openModalPopup('Action Not Allowed', selfMsg, 'error');
       return;
     }
 
@@ -1771,6 +1777,7 @@ export default function App() {
 
     try {
       if (demoMode) {
+        openModalPopup('Contact Request', 'Checking pending requests...', 'loading');
         const existingPending = contactRequests.some(
           (r) =>
             r.status === 'pending' &&
@@ -1789,11 +1796,11 @@ export default function App() {
             id: `req_${Date.now()}`,
             from: currentUid,
             fromName: String(myProfile?.displayName || myProfile?.nickname || ''),
-            fromUsername: String(myProfile?.usernameLower || myProfile?.username || ''),
+            fromUsername: String(myProfile?.username || myProfile?.usernameLower || ''),
             fromEmail: String(myProfile?.email || 'alex@example.com').trim().toLowerCase(),
             to: targetUid,
             toName: String(targetUser?.displayName || targetUser?.nickname || ''),
-            toUsername: String(targetUser?.usernameLower || targetUser?.username || ''),
+            toUsername: String(targetUser?.username || targetUser?.usernameLower || ''),
             toEmail: String(targetUser?.email || '').trim().toLowerCase(),
             status: 'pending',
             createdAtMs: Date.now(),
@@ -1808,64 +1815,86 @@ export default function App() {
         return;
       }
 
-      if (!db) throw new Error('Firestore is not initialized.');
+      if (!db) {
+        openModalPopup('Send Failed', 'Send failed (unavailable): Firestore is not initialized.', 'error');
+        return;
+      }
 
-      // Query contactRequests where from == currentUid and check in JS if to === targetUid && status === 'pending'
-      // (Single-field index, never fails on missing composite index; also check incoming pending)
-      const [fromSnap, toSnap] = await Promise.all([
-        getDocs(query(collection(db, 'contactRequests'), where('from', '==', currentUid))),
-        getDocs(query(collection(db, 'contactRequests'), where('to', '==', currentUid))),
-      ]);
+      // Step 2: Check contactRequests for existing "pending" request (own try/catch)
+      openModalPopup('Contact Request', 'Checking for existing pending requests...', 'loading');
+      let hasPending = false;
+      try {
+        const [fromSnap, toSnap] = await Promise.all([
+          getDocs(query(collection(db, 'contactRequests'), where('from', '==', currentUid))),
+          getDocs(query(collection(db, 'contactRequests'), where('to', '==', currentUid))),
+        ]);
 
-      const outgoingPending = fromSnap.docs.some((d) => {
-        const data = d.data() || {};
-        return data.to === targetUid && data.status === 'pending';
-      });
-      const incomingPending = toSnap.docs.some((d) => {
-        const data = d.data() || {};
-        return data.from === targetUid && data.status === 'pending';
-      });
+        const outgoingPending = fromSnap.docs.some((d) => {
+          const data = d.data() || {};
+          return data.to === targetUid && data.status === 'pending';
+        });
+        const incomingPending = toSnap.docs.some((d) => {
+          const data = d.data() || {};
+          return data.from === targetUid && data.status === 'pending';
+        });
+        hasPending = outgoingPending || incomingPending;
+      } catch (err) {
+        const dupMsg = `Duplicate check failed: ${err?.message || 'Unknown error'}`;
+        setSearchError(dupMsg);
+        setContactStatusMessage(dupMsg);
+        setAppError(dupMsg);
+        openModalPopup('Duplicate Check Failed', dupMsg, 'error');
+        return;
+      }
 
-      if (outgoingPending || incomingPending) {
+      if (hasPending) {
         setContactStatusMessage('Request already pending');
         openModalPopup('Request Pending', 'A request is already pending for this user.', 'info');
         return;
       }
 
-      const fromEmail = String(authUser?.email || myProfile?.email || '').trim().toLowerCase();
-      const fromName = String(
-        authUser?.displayName || myProfile?.displayName || myProfile?.nickname || ''
-      );
-      const fromUsername = String(myProfile?.usernameLower || myProfile?.username || '');
-      const toEmail = String(targetUser?.email || '').trim().toLowerCase();
-      const toName = String(targetUser?.displayName || targetUser?.nickname || '');
-      const toUsername = String(targetUser?.usernameLower || targetUser?.username || '');
+      // Step 3: Write the new request (own try/catch)
+      openModalPopup('Contact Request', 'Sending contact request...', 'loading');
+      try {
+        const fromEmail = String(authUser?.email || myProfile?.email || '').trim().toLowerCase();
+        const fromName = String(
+          authUser?.displayName || myProfile?.displayName || myProfile?.nickname || ''
+        );
+        const fromUsername = String(
+          myProfile?.username || myProfile?.usernameLower || ''
+        );
+        const toEmail = String(targetUser?.email || '').trim().toLowerCase();
+        const toName = String(targetUser?.displayName || targetUser?.nickname || '');
+        const toUsername = String(
+          targetUser?.username || targetUser?.usernameLower || ''
+        );
 
-      await addDoc(collection(db, 'contactRequests'), {
-        from: currentUid,
-        fromName,
-        fromUsername,
-        fromEmail,
-        to: targetUid,
-        toName,
-        toUsername,
-        toEmail,
-        status: 'pending',
-        createdAt: serverTimestamp(),
-      });
+        await addDoc(collection(db, 'contactRequests'), {
+          from: currentUid,
+          fromName,
+          fromUsername,
+          fromEmail,
+          to: targetUid,
+          toName,
+          toUsername,
+          toEmail,
+          status: 'pending',
+          createdAt: serverTimestamp(),
+        });
 
-      setContactStatusMessage('Contact request sent!');
-      openModalPopup(
-        'Request Sent',
-        'You have successfully sent the request. Please wait for them to accept or decline. Please be patient.',
-        'success'
-      );
-    } catch (err) {
-      const exactErr = formatFirestoreError(err, 'Unable to send contact request.');
-      setSearchError(exactErr);
-      setContactStatusMessage(exactErr);
-      setAppError(exactErr);
-      openModalPopup('Request Failed', exactErr, 'error');
+        setContactStatusMessage('Contact request sent!');
+        openModalPopup(
+          'Request Sent',
+          'You have successfully sent the request. Please wait for them to accept or decline. Please be patient.',
+          'success'
+        );
+      } catch (err) {
+        const sendMsg = `Send failed (${err?.code || 'unknown'}): ${err?.message || 'Unable to send contact request.'}`;
+        setSearchError(sendMsg);
+        setContactStatusMessage(sendMsg);
+        setAppError(sendMsg);
+        openModalPopup('Send Failed', sendMsg, 'error');
+      }
     } finally {
       setBusyActionId('');
     }
@@ -3796,11 +3825,13 @@ export default function App() {
           </div>
         )}
 
-        {/* Custom Dark-Themed Popup Modal (replaces window.alert) */}
+        {/* Custom Dark-Themed Popup Modal (replaces browser native alert) */}
         {modalPopup && (
           <div
             className="fixed inset-0 z-[80] flex items-center justify-center bg-black/80 px-5 backdrop-blur-md"
-            onClick={() => setModalPopup(null)}
+            onClick={() => {
+              if (modalPopup.tone !== 'loading') setModalPopup(null);
+            }}
           >
             <div
               onClick={(e) => e.stopPropagation()}
@@ -3809,7 +3840,9 @@ export default function App() {
               className="animate-card-3d-in w-full max-w-[380px] rounded-3xl border border-white/25 bg-[#0D0D0D] p-5 shadow-spatial-card"
             >
               <div className="flex items-center gap-2.5">
-                {modalPopup.tone === 'error' ? (
+                {modalPopup.tone === 'loading' ? (
+                  <RefreshCw className="h-5 w-5 shrink-0 animate-spin text-white" />
+                ) : modalPopup.tone === 'error' ? (
                   <AlertTriangle className="h-5 w-5 shrink-0 text-red-400" />
                 ) : modalPopup.tone === 'success' ? (
                   <Check className="h-5 w-5 shrink-0 text-white" />
@@ -3823,13 +3856,15 @@ export default function App() {
                 {modalPopup.message}
               </p>
 
-              <button
-                type="button"
-                onClick={() => setModalPopup(null)}
-                className="mt-5 w-full rounded-2xl bg-white py-2.5 text-xs font-semibold text-black shadow-spatial-white transition active:scale-[0.98]"
-              >
-                OK
-              </button>
+              {modalPopup.tone !== 'loading' && (
+                <button
+                  type="button"
+                  onClick={() => setModalPopup(null)}
+                  className="mt-5 w-full rounded-2xl bg-white py-2.5 text-xs font-semibold text-black shadow-spatial-white transition active:scale-[0.98]"
+                >
+                  OK
+                </button>
+              )}
             </div>
           </div>
         )}

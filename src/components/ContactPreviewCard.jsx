@@ -1,6 +1,6 @@
 import React from 'react';
 import { Check, Clock, MessageSquare, UserCheck, UserPlus, X } from 'lucide-react';
-import { AvatarRing3D, StatusDot, Tilt3DCard } from './Spatial3D';
+import { AvatarRing3D, StatusDot } from './Spatial3D';
 
 export function ContactPreviewCard({
   user,
@@ -21,9 +21,8 @@ export function ContactPreviewCard({
   const secondaryHandle = user.usernameLower ? `@${user.usernameLower}` : user.email || '';
 
   const card = (
-    <Tilt3DCard
-      intensity={8}
-      className="animate-card-3d-in rounded-3xl border border-white/20 bg-[#0D0D0D] p-4 shadow-spatial-card"
+    <div
+      className="relative z-10 animate-card-3d-in rounded-3xl border border-white/20 bg-[#0D0D0D] p-4 shadow-spatial-card"
     >
       <div className="flex items-start justify-between gap-3">
         <div className="flex items-center gap-3.5 min-w-0">
@@ -111,8 +110,11 @@ export function ContactPreviewCard({
           <button
             type="button"
             disabled={loading}
-            onClick={() => onAddContact(user)}
-            className="flex w-full items-center justify-center gap-2 rounded-2xl bg-white py-2.5 text-xs font-semibold text-black shadow-spatial-white transition active:scale-[0.98] disabled:opacity-50"
+            onClick={(e) => {
+              e.stopPropagation();
+              if (onAddContact) onAddContact(user);
+            }}
+            className="relative z-20 flex w-full cursor-pointer items-center justify-center gap-2 rounded-2xl bg-white py-2.5 text-xs font-semibold text-black shadow-spatial-white transition active:scale-[0.98] disabled:opacity-50"
           >
             <UserPlus className="h-3.5 w-3.5" />
             {loading ? 'Sending...' : 'Add Contact'}
@@ -126,7 +128,7 @@ export function ContactPreviewCard({
           <span>Detected via invite link</span>
         </div>
       )}
-    </Tilt3DCard>
+    </div>
   );
 
   if (!isModal) return card;
