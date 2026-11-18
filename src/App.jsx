@@ -98,6 +98,20 @@ function getMillis(ts, fallback = 0) {
   return fallback;
 }
 
+function withTimeout(promise, ms = 8000, label = 'Firestore operation') {
+  let timerId;
+  const timeoutPromise = new Promise((_, reject) => {
+    timerId = setTimeout(() => {
+      const err = new Error(`${label} timed out after ${Math.round(ms / 1000)} seconds.`);
+      err.code = 'timeout';
+      reject(err);
+    }, ms);
+  });
+  return Promise.race([promise, timeoutPromise]).finally(() => {
+    if (timerId) clearTimeout(timerId);
+  });
+}
+
 export default function App() {
   // Demo / Preview state (only used if Firebase placeholders are present & user enters Preview Mode)
   const [demoMode, setDemoMode] = useState(false);
@@ -226,16 +240,12 @@ export default function App() {
   const reportOwnerError = useCallback((err, fallback = 'Admin action failed.') => {
     const exact = formatFirestoreError(err, fallback);
     setOwnerError(exact);
-    setAppError(exact);
+    setAppError('');
   }, []);
 
-  const reportOwnerSuccess = useCallback(
-    (msg) => {
-      setOwnerNotice(msg);
-      showAppStatus(msg);
-    },
-    [showAppStatus]
-  );
+  const reportOwnerSuccess = useCallback((msg) => {
+    setOwnerNotice(msg);
+  }, []);
 
   const openModalPopup = useCallback((title, message, tone = 'info') => {
     setModalPopup({ title, message, tone });
@@ -1172,7 +1182,6 @@ export default function App() {
       if (errors.length > 0) {
         const joined = errors.join(' • ');
         setOwnerError(joined);
-        setAppError(joined);
       }
     } catch (err) {
       reportOwnerError(err, 'Unable to load Owner Console data.');
@@ -1294,6 +1303,53 @@ export default function App() {
       reportOwnerSuccess('Deleted / cleared active announcement.');
     } catch (err) {
       reportOwnerError(err, 'Clear announcement failed.');
+    } finally {
+      setAnnouncementSaving(false);
+    }
+  };
+
+  const handleToggleAnnouncementActive = async () => {
+    if (!isOwnerAdmin || announcementSaving) return;
+    const nextActive = !announcementActiveDraft;
+    setAnnouncementActiveDraft(nextActive);
+    setOwnerError('');
+    setOwnerNotice('');
+    const cleanText = String(announcementTextDraft || '').trim().slice(0, 180);
+    if (nextActive && !cleanText) {
+      return;
+    }
+    setAnnouncementSaving(true);
+    const nextAnnouncement = {
+      id: appState.announcement?.id || (cleanText ? `ann_${Date.now()}` : ''),
+      active: Boolean(nextActive && cleanText),
+      text: cleanText,
+      updatedBy: String(myProfile?.uid || authUser?.uid || ''),
+    };
+    try {
+      if (demoMode) {
+        setAppState((prev) => ({ ...prev, announcement: nextAnnouncement }));
+        reportOwnerSuccess(`Announcement ${nextAnnouncement.active ? 'activated' : 'hidden'} (preview).`);
+        return;
+      }
+      if (!db) throw new Error('Firestore is not initialized.');
+      await setDoc(
+        doc(db, 'config', 'appState'),
+        {
+          announcement: { ...nextAnnouncement, updatedAt: serverTimestamp() },
+          updatedAt: serverTimestamp(),
+        },
+        { merge: true }
+      );
+      await appendAdminLog(
+        'announcement_toggle',
+        'config/appState',
+        `active=${nextAnnouncement.active}`
+      );
+      reportOwnerSuccess(
+        `Global Announcement ${nextAnnouncement.active ? 'activated' : 'hidden'} in config/appState.`
+      );
+    } catch (err) {
+      reportOwnerError(err, 'Toggle announcement failed.');
     } finally {
       setAnnouncementSaving(false);
     }
@@ -1739,50 +1795,46 @@ export default function App() {
   };
 
   const handleAddContact = async (targetUser) => {
-    const currentUid = authUser?.uid || myProfile?.uid;
-    const targetUid = targetUser?.uid || targetUser?.id;
-
-    // Immediately open visible custom modal popup so it never fails silently
-    openModalPopup('Contact Request', 'Verifying user details...', 'loading');
-
-    // Step 1: Verify sender and target UIDs exist
-    if (!currentUid || !targetUid) {
-      const missingMsg = 'Error: Missing sender or target UID';
-      setSearchError(missingMsg);
-      setContactStatusMessage(missingMsg);
-      openModalPopup('Request Failed', missingMsg, 'error');
-      return;
-    }
-
-    if (targetUid === currentUid) {
-      const selfMsg = 'You cannot send a contact request to yourself.';
-      setSearchError(selfMsg);
-      setContactStatusMessage(selfMsg);
-      openModalPopup('Action Not Allowed', selfMsg, 'error');
-      return;
-    }
-
-    const gate = contactRequestLimiterRef.current.check();
-    if (!gate.allowed) {
-      setSearchError(gate.message);
-      setContactStatusMessage(gate.message);
-      openModalPopup('Please Wait', gate.message, 'error');
-      return;
-    }
-
-    const pairId = getPairId(currentUid, targetUid);
-    setBusyActionId(pairId);
-    setSearchError('');
-    setContactStatusMessage('');
-
     try {
+      const senderUid = demoMode ? myProfile?.uid : auth?.currentUser?.uid;
+      const targetUid = String(targetUser?.uid || targetUser?.id || '').trim();
+
+      if (!senderUid || !targetUid) {
+        const missingMsg = 'Error: Missing sender or target UID';
+        setSearchError(missingMsg);
+        setContactStatusMessage(missingMsg);
+        openModalPopup('Request Failed', missingMsg, 'error');
+        return;
+      }
+
+      if (targetUid === senderUid) {
+        const selfMsg = 'You cannot send a contact request to yourself.';
+        setSearchError(selfMsg);
+        setContactStatusMessage(selfMsg);
+        openModalPopup('Action Not Allowed', selfMsg, 'error');
+        return;
+      }
+
+      const gate = contactRequestLimiterRef.current.check();
+      if (!gate.allowed) {
+        setSearchError(gate.message);
+        setContactStatusMessage(gate.message);
+        openModalPopup('Please Wait', gate.message, 'error');
+        return;
+      }
+
+      const pairId = getPairId(senderUid, targetUid);
+      setBusyActionId(pairId);
+      setSearchError('');
+      setContactStatusMessage('');
+
       if (demoMode) {
-        openModalPopup('Contact Request', 'Checking pending requests...', 'loading');
+        openModalPopup('Contact Request', 'Checking existing requests...', 'loading');
         const existingPending = contactRequests.some(
           (r) =>
             r.status === 'pending' &&
-            ((r.from === currentUid && r.to === targetUid) ||
-              (r.from === targetUid && r.to === currentUid) ||
+            ((r.from === senderUid && r.to === targetUid) ||
+              (r.from === targetUid && r.to === senderUid) ||
               r.id === pairId)
         );
         if (existingPending) {
@@ -1790,11 +1842,12 @@ export default function App() {
           openModalPopup('Request Pending', 'A request is already pending for this user.', 'info');
           return;
         }
+        openModalPopup('Contact Request', 'Sending contact request...', 'loading');
         setContactRequests((prev) => [
           ...prev,
           {
             id: `req_${Date.now()}`,
-            from: currentUid,
+            from: senderUid,
             fromName: String(myProfile?.displayName || myProfile?.nickname || ''),
             fromUsername: String(myProfile?.username || myProfile?.usernameLower || ''),
             fromEmail: String(myProfile?.email || 'alex@example.com').trim().toLowerCase(),
@@ -1816,85 +1869,58 @@ export default function App() {
       }
 
       if (!db) {
-        openModalPopup('Send Failed', 'Send failed (unavailable): Firestore is not initialized.', 'error');
-        return;
+        throw new Error('Firestore is not initialized.');
       }
 
-      // Step 2: Check contactRequests for existing "pending" request (own try/catch)
-      openModalPopup('Contact Request', 'Checking for existing pending requests...', 'loading');
-      let hasPending = false;
-      try {
-        const [fromSnap, toSnap] = await Promise.all([
-          getDocs(query(collection(db, 'contactRequests'), where('from', '==', currentUid))),
-          getDocs(query(collection(db, 'contactRequests'), where('to', '==', currentUid))),
-        ]);
+      // Check existing requests (8-second timeout)
+      openModalPopup('Contact Request', 'Checking existing requests...', 'loading');
+      const existingSnap = await withTimeout(
+        getDocs(query(collection(db, 'contactRequests'), where('from', '==', senderUid))),
+        8000,
+        'Checking existing requests'
+      );
 
-        const outgoingPending = fromSnap.docs.some((d) => {
-          const data = d.data() || {};
-          return data.to === targetUid && data.status === 'pending';
-        });
-        const incomingPending = toSnap.docs.some((d) => {
-          const data = d.data() || {};
-          return data.from === targetUid && data.status === 'pending';
-        });
-        hasPending = outgoingPending || incomingPending;
-      } catch (err) {
-        const dupMsg = `Duplicate check failed: ${err?.message || 'Unknown error'}`;
-        setSearchError(dupMsg);
-        setContactStatusMessage(dupMsg);
-        setAppError(dupMsg);
-        openModalPopup('Duplicate Check Failed', dupMsg, 'error');
-        return;
-      }
+      const alreadyPending = existingSnap.docs.some((d) => {
+        const data = d.data() || {};
+        return data.to === targetUid && data.status === 'pending';
+      });
 
-      if (hasPending) {
+      if (alreadyPending) {
         setContactStatusMessage('Request already pending');
         openModalPopup('Request Pending', 'A request is already pending for this user.', 'info');
         return;
       }
 
-      // Step 3: Write the new request (own try/catch)
+      // Send new contact request (8-second timeout)
       openModalPopup('Contact Request', 'Sending contact request...', 'loading');
-      try {
-        const fromEmail = String(authUser?.email || myProfile?.email || '').trim().toLowerCase();
-        const fromName = String(
-          authUser?.displayName || myProfile?.displayName || myProfile?.nickname || ''
-        );
-        const fromUsername = String(
-          myProfile?.username || myProfile?.usernameLower || ''
-        );
-        const toEmail = String(targetUser?.email || '').trim().toLowerCase();
-        const toName = String(targetUser?.displayName || targetUser?.nickname || '');
-        const toUsername = String(
-          targetUser?.username || targetUser?.usernameLower || ''
-        );
-
-        await addDoc(collection(db, 'contactRequests'), {
-          from: currentUid,
-          fromName,
-          fromUsername,
-          fromEmail,
+      await withTimeout(
+        addDoc(collection(db, 'contactRequests'), {
+          from: senderUid,
+          fromName: auth?.currentUser?.displayName || '',
+          fromUsername: myProfile?.username || myProfile?.usernameLower || '',
+          fromEmail: (auth?.currentUser?.email || '').toLowerCase(),
           to: targetUid,
-          toName,
-          toUsername,
-          toEmail,
+          toName: targetUser?.displayName || targetUser?.nickname || '',
+          toUsername: targetUser?.username || targetUser?.usernameLower || '',
+          toEmail: (targetUser?.email || '').toLowerCase(),
           status: 'pending',
           createdAt: serverTimestamp(),
-        });
+        }),
+        8000,
+        'Sending contact request'
+      );
 
-        setContactStatusMessage('Contact request sent!');
-        openModalPopup(
-          'Request Sent',
-          'You have successfully sent the request. Please wait for them to accept or decline. Please be patient.',
-          'success'
-        );
-      } catch (err) {
-        const sendMsg = `Send failed (${err?.code || 'unknown'}): ${err?.message || 'Unable to send contact request.'}`;
-        setSearchError(sendMsg);
-        setContactStatusMessage(sendMsg);
-        setAppError(sendMsg);
-        openModalPopup('Send Failed', sendMsg, 'error');
-      }
+      setContactStatusMessage('Contact request sent!');
+      openModalPopup(
+        'Request Sent',
+        'You have successfully sent the request. Please wait for them to accept or decline. Please be patient.',
+        'success'
+      );
+    } catch (err) {
+      const exactErr = `Error (${err?.code || 'JS'}): ${err?.message || String(err)}`;
+      setSearchError(exactErr);
+      setContactStatusMessage(exactErr);
+      openModalPopup('Request Failed', exactErr, 'error');
     } finally {
       setBusyActionId('');
     }
@@ -3340,8 +3366,9 @@ export default function App() {
                       </div>
                       <button
                         type="button"
-                        onClick={() => setAnnouncementActiveDraft((v) => !v)}
-                        className={`flex h-6 w-11 items-center rounded-full p-0.5 transition ${
+                        disabled={announcementSaving}
+                        onClick={handleToggleAnnouncementActive}
+                        className={`flex h-6 w-11 items-center rounded-full p-0.5 transition disabled:opacity-50 ${
                           announcementActiveDraft ? 'bg-white justify-end' : 'bg-white/20 justify-start'
                         }`}
                         aria-label="Toggle Global Announcement Active"
@@ -3829,9 +3856,7 @@ export default function App() {
         {modalPopup && (
           <div
             className="fixed inset-0 z-[80] flex items-center justify-center bg-black/80 px-5 backdrop-blur-md"
-            onClick={() => {
-              if (modalPopup.tone !== 'loading') setModalPopup(null);
-            }}
+            onClick={() => setModalPopup(null)}
           >
             <div
               onClick={(e) => e.stopPropagation()}
@@ -3856,15 +3881,13 @@ export default function App() {
                 {modalPopup.message}
               </p>
 
-              {modalPopup.tone !== 'loading' && (
-                <button
-                  type="button"
-                  onClick={() => setModalPopup(null)}
-                  className="mt-5 w-full rounded-2xl bg-white py-2.5 text-xs font-semibold text-black shadow-spatial-white transition active:scale-[0.98]"
-                >
-                  OK
-                </button>
-              )}
+              <button
+                type="button"
+                onClick={() => setModalPopup(null)}
+                className="mt-5 w-full rounded-2xl bg-white py-2.5 text-xs font-semibold text-black shadow-spatial-white transition active:scale-[0.98]"
+              >
+                OK / Close
+              </button>
             </div>
           </div>
         )}
