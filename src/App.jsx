@@ -73,6 +73,16 @@ function normalizeHandle(raw) {
   return (raw || '').trim().replace(/^@+/, '').toLowerCase().replace(/[^a-z0-9_]/g, '').slice(0, 12);
 }
 
+function normalizeUserDoc(docId, data = {}) {
+  const safeData = data && typeof data === 'object' ? data : {};
+  const resolvedUid = String(safeData.uid || docId || '');
+  return {
+    ...safeData,
+    id: String(docId || resolvedUid),
+    uid: resolvedUid,
+  };
+}
+
 function formatFirestoreError(err, fallback = 'Firestore operation failed.') {
   if (!err) return fallback;
   if (err.code && err.message) return `${err.code}: ${err.message}`;
@@ -174,6 +184,7 @@ export default function App() {
   const [announcementSaving, setAnnouncementSaving] = useState(false);
   const [badgeDrafts, setBadgeDrafts] = useState({});
   const [ownerActionUid, setOwnerActionUid] = useState('');
+  const [confirmDeleteUid, setConfirmDeleteUid] = useState('');
 
   // Demo sandbox data store
   const [demoMessagesByChat, setDemoMessagesByChat] = useState({});
@@ -210,6 +221,20 @@ export default function App() {
     statusTimerRef.current = setTimeout(() => setAppStatus(''), 3500);
   }, []);
 
+  const reportOwnerError = useCallback((err, fallback = 'Admin action failed.') => {
+    const exact = formatFirestoreError(err, fallback);
+    setOwnerError(exact);
+    setAppError(exact);
+  }, []);
+
+  const reportOwnerSuccess = useCallback(
+    (msg) => {
+      setOwnerNotice(msg);
+      showAppStatus(msg);
+    },
+    [showAppStatus]
+  );
+
   const syncUserProfileOnLogin = useCallback(async (user) => {
     if (!isFirebaseConfigured || !db || !user?.uid) return null;
     const userRef = doc(db, 'users', user.uid);
@@ -232,6 +257,7 @@ export default function App() {
         await setDoc(
           userRef,
           {
+            uid: user.uid,
             email: normalizedEmail,
             displayName,
             photoURL,
@@ -240,7 +266,7 @@ export default function App() {
           { merge: true }
         );
       }
-      return snap.exists() ? snap.data() : null;
+      return snap.exists() ? normalizeUserDoc(snap.id, snap.data()) : null;
     } catch (err) {
       showAppError('Profile login sync failed', err);
       return null;
@@ -353,7 +379,7 @@ export default function App() {
       userDocRef,
       (snap) => {
         if (snap.exists()) {
-          const data = { uid: snap.id, ...snap.data() };
+          const data = normalizeUserDoc(snap.id, snap.data());
           latestUserData = data;
           setMyProfile(data);
         } else {
@@ -535,7 +561,10 @@ export default function App() {
         doc(db, 'users', uid),
         (snap) => {
           if (snap.exists()) {
-            setUserProfilesMap((prev) => ({ ...prev, [uid]: { uid: snap.id, ...snap.data() } }));
+            setUserProfilesMap((prev) => ({
+              ...prev,
+              [uid]: normalizeUserDoc(snap.id, snap.data()),
+            }));
           }
         },
         (err) => showAppError(`User profile sync (${uid}) failed`, err)
@@ -643,19 +672,41 @@ export default function App() {
       if (!isFirebaseConfigured || !db) return null;
 
       const unameSnap = await getDoc(doc(db, 'usernames', handle));
-      if (!unameSnap.exists()) return null;
-      const unameData = unameSnap.data();
-      const userSnap = await getDoc(doc(db, 'users', unameData.uid));
-      if (userSnap.exists()) {
-        return { uid: userSnap.id, ...userSnap.data() };
+      if (unameSnap.exists()) {
+        const unameData = unameSnap.data() || {};
+        const targetUid = String(unameData.uid || '');
+        if (targetUid) {
+          const userSnap = await getDoc(doc(db, 'users', targetUid));
+          if (userSnap.exists()) {
+            return normalizeUserDoc(userSnap.id, userSnap.data());
+          }
+          return normalizeUserDoc(targetUid, {
+            usernameLower: unameData.usernameLower || handle,
+            nickname: unameData.nickname || `@${unameData.usernameLower || handle}`,
+            photoURL: unameData.photoURL || '',
+            status: unameData.status || 'Online',
+          });
+        }
       }
-      return {
-        uid: unameData.uid,
-        usernameLower: unameData.usernameLower,
-        nickname: unameData.nickname || `@${unameData.usernameLower}`,
-        photoURL: unameData.photoURL || '',
-        status: unameData.status || 'Online',
-      };
+
+      // Fallback for older user docs that may not have a usernames/{handle} index doc
+      const byLowerSnap = await getDocs(
+        query(collection(db, 'users'), where('usernameLower', '==', handle), limit(1))
+      );
+      if (!byLowerSnap.empty) {
+        const d = byLowerSnap.docs[0];
+        return normalizeUserDoc(d.id, d.data());
+      }
+
+      const byUsernameSnap = await getDocs(
+        query(collection(db, 'users'), where('username', '==', handle), limit(1))
+      );
+      if (!byUsernameSnap.empty) {
+        const d = byUsernameSnap.docs[0];
+        return normalizeUserDoc(d.id, d.data());
+      }
+
+      return null;
     },
     [demoMode, userProfilesMap]
   );
@@ -682,7 +733,7 @@ export default function App() {
       const snap = await getDocs(emailQuery);
       if (snap.empty) return null;
       const d = snap.docs[0];
-      return { uid: d.id, ...d.data() };
+      return normalizeUserDoc(d.id, d.data());
     },
     [demoMode, userProfilesMap]
   );
@@ -1056,7 +1107,7 @@ export default function App() {
       if (dirRes.status === 'fulfilled') {
         const snap = dirRes.value;
         const usersList = snap.docs
-          .map((d) => ({ uid: d.id, ...d.data() }))
+          .map((d) => normalizeUserDoc(d.id, d.data()))
           .sort((a, b) =>
             (a.usernameLower || a.email || a.uid).localeCompare(b.usernameLower || b.email || b.uid)
           );
@@ -1091,10 +1142,12 @@ export default function App() {
       }
 
       if (errors.length > 0) {
-        setOwnerError(errors.join(' • '));
+        const joined = errors.join(' • ');
+        setOwnerError(joined);
+        setAppError(joined);
       }
     } catch (err) {
-      setOwnerError(formatFirestoreError(err, 'Unable to load Owner Console data.'));
+      reportOwnerError(err, 'Unable to load Owner Console data.');
     } finally {
       setOwnerLoading(false);
     }
@@ -1111,7 +1164,7 @@ export default function App() {
         limit(25)
       );
       const snap = await getDocs(nextQuery);
-      const more = snap.docs.map((d) => ({ uid: d.id, ...d.data() }));
+      const more = snap.docs.map((d) => normalizeUserDoc(d.id, d.data()));
       setOwnerDirectory((prev) => [...prev, ...more]);
       setOwnerLastDoc(snap.docs[snap.docs.length - 1] || null);
       setOwnerHasMore(snap.docs.length === 25);
@@ -1123,7 +1176,7 @@ export default function App() {
         return next;
       });
     } catch (err) {
-      setOwnerError(formatFirestoreError(err, 'Failed to load more users.'));
+      reportOwnerError(err, 'Failed to load more users.');
     } finally {
       setOwnerLoading(false);
     }
@@ -1133,6 +1186,7 @@ export default function App() {
     if (!authReady || (!authUser && !demoMode) || !adminVerified || !isOwnerAdmin) return;
     setOwnerError('');
     setOwnerNotice('');
+    setConfirmDeleteUid('');
     setAnnouncementActiveDraft(Boolean(appState.announcement?.active));
     setAnnouncementTextDraft(appState.announcement?.text || '');
     setOwnerConsoleOpen(true);
@@ -1145,17 +1199,17 @@ export default function App() {
     setAnnouncementSaving(true);
     setOwnerError('');
     setOwnerNotice('');
-    const cleanText = (announcementTextDraft || '').trim().slice(0, 180);
+    const cleanText = String(announcementTextDraft || '').trim().slice(0, 180);
     const nextAnnouncement = {
       id: cleanText ? `ann_${Date.now()}` : '',
       active: Boolean(announcementActiveDraft && cleanText),
       text: cleanText,
-      updatedBy: myProfile?.uid || authUser?.uid || '',
+      updatedBy: String(myProfile?.uid || authUser?.uid || ''),
     };
     try {
       if (demoMode) {
         setAppState((prev) => ({ ...prev, announcement: nextAnnouncement }));
-        setOwnerNotice('Saved announcement to config/appState (preview).');
+        reportOwnerSuccess('Saved announcement to config/appState (preview).');
         return;
       }
       if (!db) throw new Error('Firestore is not initialized.');
@@ -1172,9 +1226,9 @@ export default function App() {
         'config/appState',
         `${nextAnnouncement.active ? 'Published' : 'Hidden'}: ${nextAnnouncement.text}`
       );
-      setOwnerNotice('Saved Global Announcement to config/appState.');
+      reportOwnerSuccess('Saved Global Announcement to config/appState.');
     } catch (err) {
-      setOwnerError(`Save announcement failed: ${formatFirestoreError(err)}`);
+      reportOwnerError(err, 'Save announcement failed.');
     } finally {
       setAnnouncementSaving(false);
     }
@@ -1189,14 +1243,14 @@ export default function App() {
       id: '',
       active: false,
       text: '',
-      updatedBy: myProfile?.uid || authUser?.uid || '',
+      updatedBy: String(myProfile?.uid || authUser?.uid || ''),
     };
     try {
       setAnnouncementActiveDraft(false);
       setAnnouncementTextDraft('');
       if (demoMode) {
         setAppState((prev) => ({ ...prev, announcement: cleared }));
-        setOwnerNotice('Cleared active announcement (preview).');
+        reportOwnerSuccess('Cleared active announcement (preview).');
         return;
       }
       if (!db) throw new Error('Firestore is not initialized.');
@@ -1209,22 +1263,22 @@ export default function App() {
         { merge: true }
       );
       await appendAdminLog('announcement_clear', 'config/appState', 'Cleared active announcement');
-      setOwnerNotice('Deleted / cleared active announcement.');
+      reportOwnerSuccess('Deleted / cleared active announcement.');
     } catch (err) {
-      setOwnerError(`Clear announcement failed: ${formatFirestoreError(err)}`);
+      reportOwnerError(err, 'Clear announcement failed.');
     } finally {
       setAnnouncementSaving(false);
     }
   };
 
   const handleToggleAppFeature = async (key, nextValue) => {
-    if (!isOwnerAdmin) return;
+    if (!isOwnerAdmin || !key) return;
     setOwnerError('');
     setOwnerNotice('');
     try {
       if (demoMode) {
         setAppState((prev) => ({ ...prev, [key]: Boolean(nextValue) }));
-        setOwnerNotice(`Updated ${key} in config/appState (preview).`);
+        reportOwnerSuccess(`Updated ${key} in config/appState (preview).`);
         return;
       }
       if (!db) throw new Error('Firestore is not initialized.');
@@ -1237,22 +1291,31 @@ export default function App() {
         { merge: true }
       );
       await appendAdminLog('feature_toggle', 'config/appState', `${key}=${Boolean(nextValue)}`);
-      setOwnerNotice(`Updated ${key} (${nextValue ? 'enabled' : 'disabled'}) in config/appState.`);
+      reportOwnerSuccess(`Updated ${key} (${nextValue ? 'enabled' : 'disabled'}) in config/appState.`);
     } catch (err) {
-      setOwnerError(`Feature toggle (${key}) failed: ${formatFirestoreError(err)}`);
+      reportOwnerError(err, `Feature toggle (${key}) failed.`);
     }
   };
 
-  const handleAssignBadge = async (targetUid, rawBadge) => {
-    if (!isOwnerAdmin || !targetUid) return;
-    const cleanBadge = (rawBadge || '').trim().slice(0, 16);
+  const handleAssignBadge = async (targetUserOrUid, rawBadge) => {
+    const targetUid = String(
+      typeof targetUserOrUid === 'string'
+        ? targetUserOrUid
+        : targetUserOrUid?.uid || targetUserOrUid?.id || ''
+    );
+    if (!isOwnerAdmin) return;
+    if (!targetUid) {
+      reportOwnerError(new Error('Missing target user ID for badge update.'));
+      return;
+    }
+    const cleanBadge = String(rawBadge || '').trim().slice(0, 16);
     setOwnerActionUid(targetUid);
     setOwnerError('');
     setOwnerNotice('');
     try {
       if (demoMode) {
         setOwnerDirectory((prev) =>
-          prev.map((u) => (u.uid === targetUid ? { ...u, badge: cleanBadge } : u))
+          prev.map((u) => ((u.uid || u.id) === targetUid ? { ...u, badge: cleanBadge } : u))
         );
         setUserProfilesMap((prev) =>
           prev[targetUid] ? { ...prev, [targetUid]: { ...prev[targetUid], badge: cleanBadge } } : prev
@@ -1260,7 +1323,7 @@ export default function App() {
         if (myProfile?.uid === targetUid) {
           setMyProfile((p) => (p ? { ...p, badge: cleanBadge } : p));
         }
-        setOwnerNotice(`Updated badge on users/${targetUid} (preview).`);
+        reportOwnerSuccess(`Updated badge on users/${targetUid} (preview).`);
         return;
       }
       if (!db) throw new Error('Firestore is not initialized.');
@@ -1270,18 +1333,23 @@ export default function App() {
       });
       await appendAdminLog('badge_update', targetUid, `badge="${cleanBadge}"`);
       setOwnerDirectory((prev) =>
-        prev.map((u) => (u.uid === targetUid ? { ...u, badge: cleanBadge } : u))
+        prev.map((u) => ((u.uid || u.id) === targetUid ? { ...u, badge: cleanBadge } : u))
       );
-      setOwnerNotice(`Updated badge on users/${targetUid}.`);
+      reportOwnerSuccess(`Updated badge on users/${targetUid}.`);
     } catch (err) {
-      setOwnerError(`Badge update failed (users/${targetUid}): ${formatFirestoreError(err)}`);
+      reportOwnerError(err, `Badge update failed (users/${targetUid}).`);
     } finally {
       setOwnerActionUid('');
     }
   };
 
   const handleUpdateUserRole = async (targetUser, nextRole) => {
-    if (!isOwnerAdmin || !targetUser?.uid) return;
+    if (!isOwnerAdmin) return;
+    const targetUid = String(targetUser?.uid || targetUser?.id || '');
+    if (!targetUid) {
+      reportOwnerError(new Error('Missing target user ID for role update.'));
+      return;
+    }
     const cleanRole =
       nextRole === 'owner'
         ? 'owner'
@@ -1290,87 +1358,131 @@ export default function App() {
         : nextRole === 'admin'
         ? 'admin'
         : 'user';
-    if (targetUser.uid === myProfile?.uid && cleanRole === 'user') {
-      setOwnerError('You cannot remove admin/owner role from your own active session.');
+    if (targetUid === myProfile?.uid && cleanRole === 'user') {
+      reportOwnerError(new Error('You cannot remove admin/owner role from your own active session.'));
       return;
     }
     const nextIsAdmin = cleanRole === 'admin' || cleanRole === 'owner' || cleanRole === 'superadmin';
     const nextIsOwner = cleanRole === 'owner';
-    setOwnerActionUid(targetUser.uid);
+    setOwnerActionUid(targetUid);
     setOwnerError('');
     setOwnerNotice('');
     try {
       if (demoMode) {
         setOwnerDirectory((prev) =>
           prev.map((u) =>
-            u.uid === targetUser.uid
+            (u.uid || u.id) === targetUid
               ? { ...u, role: cleanRole, isAdmin: nextIsAdmin, isOwner: nextIsOwner }
               : u
           )
         );
-        setOwnerNotice(`Updated role=${cleanRole} on users/${targetUser.uid} (preview).`);
+        reportOwnerSuccess(`Updated role=${cleanRole} on users/${targetUid} (preview).`);
         return;
       }
       if (!db) throw new Error('Firestore is not initialized.');
-      await updateDoc(doc(db, 'users', targetUser.uid), {
+      await updateDoc(doc(db, 'users', targetUid), {
         role: cleanRole,
         isAdmin: nextIsAdmin,
         isOwner: nextIsOwner,
         updatedAt: serverTimestamp(),
       });
-      await appendAdminLog('role_update', targetUser.uid, `role=${cleanRole}`);
+      await appendAdminLog('role_update', targetUid, `role=${cleanRole}`);
       setOwnerDirectory((prev) =>
         prev.map((u) =>
-          u.uid === targetUser.uid
+          (u.uid || u.id) === targetUid
             ? { ...u, role: cleanRole, isAdmin: nextIsAdmin, isOwner: nextIsOwner }
             : u
         )
       );
-      setOwnerNotice(`Updated role to ${cleanRole} on users/${targetUser.uid}.`);
+      reportOwnerSuccess(`Updated role to ${cleanRole} on users/${targetUid}.`);
     } catch (err) {
-      setOwnerError(`Role update failed (users/${targetUser.uid}): ${formatFirestoreError(err)}`);
+      reportOwnerError(err, `Role update failed (users/${targetUid}).`);
     } finally {
       setOwnerActionUid('');
     }
   };
 
   const handleToggleBan = async (targetUser) => {
-    if (!isOwnerAdmin || !targetUser?.uid) return;
-    if (targetUser.uid === myProfile?.uid) {
-      setOwnerError('You cannot ban your own active admin account.');
+    if (!isOwnerAdmin) return;
+    const targetUid = String(targetUser?.uid || targetUser?.id || '');
+    if (!targetUid) {
+      reportOwnerError(new Error('Missing target user ID for ban toggle.'));
       return;
     }
-    const nextBanned = !Boolean(targetUser.isBanned);
-    setOwnerActionUid(targetUser.uid);
+    if (targetUid === myProfile?.uid) {
+      reportOwnerError(new Error('You cannot ban your own active admin account.'));
+      return;
+    }
+    const nextBanned = !Boolean(targetUser?.isBanned);
+    setOwnerActionUid(targetUid);
     setOwnerError('');
     setOwnerNotice('');
     try {
       if (demoMode) {
         setOwnerDirectory((prev) =>
-          prev.map((u) => (u.uid === targetUser.uid ? { ...u, isBanned: nextBanned } : u))
+          prev.map((u) => ((u.uid || u.id) === targetUid ? { ...u, isBanned: nextBanned } : u))
         );
         setUserProfilesMap((prev) =>
-          prev[targetUser.uid]
-            ? { ...prev, [targetUser.uid]: { ...prev[targetUser.uid], isBanned: nextBanned } }
+          prev[targetUid]
+            ? { ...prev, [targetUid]: { ...prev[targetUid], isBanned: nextBanned } }
             : prev
         );
-        setOwnerNotice(`Updated isBanned on users/${targetUser.uid} (preview).`);
+        reportOwnerSuccess(`Updated isBanned on users/${targetUid} (preview).`);
         return;
       }
       if (!db) throw new Error('Firestore is not initialized.');
-      await updateDoc(doc(db, 'users', targetUser.uid), {
+      await updateDoc(doc(db, 'users', targetUid), {
         isBanned: nextBanned,
         updatedAt: serverTimestamp(),
       });
-      await appendAdminLog('ban_toggle', targetUser.uid, `isBanned=${nextBanned}`);
+      await appendAdminLog('ban_toggle', targetUid, `isBanned=${nextBanned}`);
       setOwnerDirectory((prev) =>
-        prev.map((u) => (u.uid === targetUser.uid ? { ...u, isBanned: nextBanned } : u))
+        prev.map((u) => ((u.uid || u.id) === targetUid ? { ...u, isBanned: nextBanned } : u))
       );
-      setOwnerNotice(
-        `${nextBanned ? 'Banned' : 'Unbanned'} user on users/${targetUser.uid}.`
-      );
+      reportOwnerSuccess(`${nextBanned ? 'Banned' : 'Unbanned'} user on users/${targetUid}.`);
     } catch (err) {
-      setOwnerError(`Ban toggle failed (users/${targetUser.uid}): ${formatFirestoreError(err)}`);
+      reportOwnerError(err, `Ban toggle failed (users/${targetUid}).`);
+    } finally {
+      setOwnerActionUid('');
+    }
+  };
+
+  const handleDeleteUser = async (targetUser) => {
+    if (!isOwnerAdmin) return;
+    const targetUid = String(targetUser?.uid || targetUser?.id || '');
+    if (!targetUid) {
+      reportOwnerError(new Error('Missing target user ID for delete.'));
+      return;
+    }
+    if (targetUid === myProfile?.uid) {
+      reportOwnerError(new Error('You cannot delete your own active admin account.'));
+      return;
+    }
+    setOwnerActionUid(targetUid);
+    setOwnerError('');
+    setOwnerNotice('');
+    try {
+      if (demoMode) {
+        setOwnerDirectory((prev) => prev.filter((u) => (u.uid || u.id) !== targetUid));
+        setConfirmDeleteUid('');
+        reportOwnerSuccess(`Deleted user ${targetUid} (preview).`);
+        return;
+      }
+      if (!db) throw new Error('Firestore is not initialized.');
+      await deleteDoc(doc(db, 'users', targetUid));
+      if (targetUser?.usernameLower) {
+        await deleteDoc(doc(db, 'usernames', String(targetUser.usernameLower))).catch(() => {});
+      }
+      await appendAdminLog(
+        'user_delete',
+        targetUid,
+        String(targetUser?.email || targetUser?.usernameLower || targetUid)
+      );
+      setOwnerDirectory((prev) => prev.filter((u) => (u.uid || u.id) !== targetUid));
+      setConfirmDeleteUid('');
+      reportOwnerSuccess(`Deleted user users/${targetUid}.`);
+    } catch (err) {
+      reportOwnerError(err, `Delete user failed (users/${targetUid}).`);
     } finally {
       setOwnerActionUid('');
     }
@@ -1383,18 +1495,38 @@ export default function App() {
     setOwnerNotice('');
     try {
       if (!db) throw new Error('Firestore is not initialized.');
-      await updateDoc(doc(db, 'reports', reportId), {
+      await updateDoc(doc(db, 'reports', String(reportId)), {
         status: cleanStatus,
-        reviewedBy: myProfile?.uid || '',
+        reviewedBy: String(myProfile?.uid || authUser?.uid || ''),
         updatedAt: serverTimestamp(),
       });
-      await appendAdminLog('report_update', reportId, `status=${cleanStatus}`);
+      await appendAdminLog('report_update', String(reportId), `status=${cleanStatus}`);
       setOwnerReports((prev) =>
         prev.map((r) => (r.id === reportId ? { ...r, status: cleanStatus } : r))
       );
-      setOwnerNotice(`Marked report ${reportId} as ${cleanStatus}.`);
+      reportOwnerSuccess(`Marked report ${reportId} as ${cleanStatus}.`);
     } catch (err) {
-      setOwnerError(`Report update failed: ${formatFirestoreError(err)}`);
+      reportOwnerError(err, 'Report update failed.');
+    }
+  };
+
+  const handleClearAdminLogs = async () => {
+    if (!isOwnerAdmin) return;
+    setOwnerError('');
+    setOwnerNotice('');
+    try {
+      if (demoMode) {
+        setOwnerLogs([]);
+        reportOwnerSuccess('Cleared admin audit logs (preview).');
+        return;
+      }
+      if (!db) throw new Error('Firestore is not initialized.');
+      const logsSnap = await getDocs(collection(db, 'adminLogs'));
+      await Promise.all(logsSnap.docs.map((d) => deleteDoc(d.ref)));
+      setOwnerLogs([]);
+      reportOwnerSuccess(`Cleared ${logsSnap.size} admin audit log${logsSnap.size === 1 ? '' : 's'}.`);
+    } catch (err) {
+      reportOwnerError(err, 'Clear admin logs failed.');
     }
   };
 
@@ -1434,7 +1566,7 @@ export default function App() {
         setSearchResult(null);
         setSearchError('User not found');
       } else {
-        setSearchResult(found);
+        setSearchResult(normalizeUserDoc(found.id || found.uid, found));
       }
     } catch (err) {
       setSearchResult(null);
@@ -1447,12 +1579,20 @@ export default function App() {
   };
 
   const handleAddContact = async (targetUser) => {
-    const currentUid = authUser?.uid || myProfile?.uid;
-    if (!currentUid || !targetUser?.uid) return;
+    const currentUid = String(authUser?.uid || myProfile?.uid || '');
+    const targetUid = String(targetUser?.uid || targetUser?.id || '');
+    if (!currentUid || !targetUid) {
+      const failMsg = 'Failed: Unable to resolve user ID for contact request.';
+      setSearchError(failMsg);
+      setContactStatusMessage(failMsg);
+      setAppError(failMsg);
+      return;
+    }
 
-    if (targetUser.uid === currentUid) {
-      setSearchError('You cannot send a contact request to yourself.');
-      setContactStatusMessage('You cannot send a contact request to yourself.');
+    if (targetUid === currentUid) {
+      setSearchError('You cannot add yourself');
+      setContactStatusMessage('You cannot add yourself');
+      setAppError('You cannot add yourself');
       return;
     }
 
@@ -1460,10 +1600,11 @@ export default function App() {
     if (!gate.allowed) {
       setSearchError(gate.message);
       setContactStatusMessage(gate.message);
+      setAppError(gate.message);
       return;
     }
 
-    const pairId = getPairId(currentUid, targetUser.uid);
+    const pairId = getPairId(currentUid, targetUid);
     setBusyActionId(pairId);
     setSearchError('');
     setContactStatusMessage('');
@@ -1473,12 +1614,13 @@ export default function App() {
         const existingPending = contactRequests.some(
           (r) =>
             r.status === 'pending' &&
-            ((r.from === currentUid && r.to === targetUser.uid) ||
-              (r.from === targetUser.uid && r.to === currentUid) ||
+            ((r.from === currentUid && r.to === targetUid) ||
+              (r.from === targetUid && r.to === currentUid) ||
               r.id === pairId)
         );
         if (existingPending) {
           setContactStatusMessage('Request already pending');
+          showAppStatus('Request already pending');
           return;
         }
         setContactRequests((prev) => [
@@ -1486,17 +1628,19 @@ export default function App() {
           {
             id: `req_${Date.now()}`,
             from: currentUid,
-            fromEmail: (myProfile?.email || 'alex@example.com').trim().toLowerCase(),
-            fromName: myProfile?.displayName || myProfile?.nickname || '',
-            to: targetUser.uid,
-            toEmail: (targetUser.email || '').trim().toLowerCase(),
-            toName: targetUser.displayName || targetUser.nickname || '',
+            fromEmail: String(myProfile?.email || 'alex@example.com').trim().toLowerCase(),
+            fromName: String(myProfile?.displayName || myProfile?.nickname || ''),
+            fromUsername: String(myProfile?.usernameLower || myProfile?.username || ''),
+            to: targetUid,
+            toEmail: String(targetUser?.email || '').trim().toLowerCase(),
+            toName: String(targetUser?.displayName || targetUser?.nickname || ''),
+            toUsername: String(targetUser?.usernameLower || targetUser?.username || ''),
             status: 'pending',
             createdAtMs: Date.now(),
           },
         ]);
-        setContactStatusMessage('Contact request sent');
-        showAppStatus('Contact request sent');
+        setContactStatusMessage('Contact request sent!');
+        showAppStatus('Contact request sent!');
         return;
       }
 
@@ -1508,7 +1652,7 @@ export default function App() {
           query(
             collection(db, 'contactRequests'),
             where('from', '==', currentUid),
-            where('to', '==', targetUser.uid),
+            where('to', '==', targetUid),
             where('status', '==', 'pending'),
             limit(1)
           )
@@ -1516,7 +1660,7 @@ export default function App() {
         getDocs(
           query(
             collection(db, 'contactRequests'),
-            where('from', '==', targetUser.uid),
+            where('from', '==', targetUid),
             where('to', '==', currentUid),
             where('status', '==', 'pending'),
             limit(1)
@@ -1530,29 +1674,36 @@ export default function App() {
         return;
       }
 
-      const fromEmail = (authUser?.email || myProfile?.email || '').trim().toLowerCase();
-      const fromName = authUser?.displayName || myProfile?.displayName || myProfile?.nickname || '';
-      const toEmail = (targetUser.email || '').trim().toLowerCase();
-      const toName = targetUser.displayName || targetUser.nickname || '';
+      const fromEmail = String(authUser?.email || myProfile?.email || '').trim().toLowerCase();
+      const fromName = String(
+        authUser?.displayName || myProfile?.displayName || myProfile?.nickname || ''
+      );
+      const fromUsername = String(myProfile?.usernameLower || myProfile?.username || '');
+      const toEmail = String(targetUser?.email || '').trim().toLowerCase();
+      const toName = String(targetUser?.displayName || targetUser?.nickname || '');
+      const toUsername = String(targetUser?.usernameLower || targetUser?.username || '');
 
       await addDoc(collection(db, 'contactRequests'), {
         from: currentUid,
         fromEmail,
         fromName,
-        to: targetUser.uid,
+        fromUsername,
+        to: targetUid,
         toEmail,
         toName,
+        toUsername,
         status: 'pending',
         createdAt: serverTimestamp(),
       });
 
-      setContactStatusMessage('Contact request sent');
-      showAppStatus('Contact request sent');
+      setContactStatusMessage('Contact request sent!');
+      showAppStatus('Contact request sent!');
     } catch (err) {
-      const msg = formatFirestoreError(err, 'Failed to send contact request.');
-      setSearchError(msg);
-      setContactStatusMessage(msg);
-      showAppError('Send contact request failed', err);
+      const baseMsg = `Failed: ${err?.message || 'Unable to send contact request.'}`;
+      const detailedMsg = err?.code ? `${baseMsg} (${err.code})` : baseMsg;
+      setSearchError(detailedMsg);
+      setContactStatusMessage(detailedMsg);
+      setAppError(detailedMsg);
     } finally {
       setBusyActionId('');
     }
@@ -2526,23 +2677,27 @@ export default function App() {
             </div>
           )}
 
-          {searchResult && (
-            <div className="mt-3">
-              <ContactPreviewCard
-                user={searchResult}
-                relationship={getRelationship(searchResult.uid)}
-                loading={busyActionId === getPairId(myProfile.uid, searchResult.uid)}
-                statusMessage={contactStatusMessage}
-                onAddContact={handleAddContact}
-                onAcceptRequest={handleAcceptRequest}
-                onOpenChat={openDirectChat}
-                onClose={() => {
-                  setSearchResult(null);
-                  setContactStatusMessage('');
-                }}
-              />
-            </div>
-          )}
+          {searchResult && (() => {
+            const currentUid = String(authUser?.uid || myProfile?.uid || '');
+            const targetUid = String(searchResult.uid || searchResult.id || '');
+            return (
+              <div className="mt-3">
+                <ContactPreviewCard
+                  user={searchResult}
+                  relationship={getRelationship(targetUid)}
+                  loading={Boolean(targetUid) && busyActionId === getPairId(currentUid, targetUid)}
+                  statusMessage={contactStatusMessage}
+                  onAddContact={handleAddContact}
+                  onAcceptRequest={handleAcceptRequest}
+                  onOpenChat={openDirectChat}
+                  onClose={() => {
+                    setSearchResult(null);
+                    setContactStatusMessage('');
+                  }}
+                />
+              </div>
+            );
+          })()}
 
           {/* Filter Tabs */}
           <div className="mt-3 grid grid-cols-3 gap-1.5 rounded-2xl border border-white/12 bg-[#0D0D0D] p-1">
@@ -2747,11 +2902,11 @@ export default function App() {
   return (
     <div className="min-h-[100dvh] w-full bg-black flex justify-center">
       <div className="relative flex h-[100dvh] w-full max-w-[480px] flex-col overflow-hidden bg-black sm:border-x sm:border-white/14 sm:shadow-[0_0_90px_rgba(255,255,255,0.05)]">
-        {/* Visible Global Firebase / Action Error Alert */}
+        {/* Visible Global Firebase / Action Error Alert (always above modals) */}
         {appError && (
           <div
             role="alert"
-            className="shrink-0 flex items-start justify-between gap-2.5 border-b border-white/30 bg-[#181818] px-3.5 py-2.5 text-white z-40"
+            className="fixed top-2 left-1/2 z-[70] flex w-[calc(100%-1.5rem)] max-w-[456px] -translate-x-1/2 items-start justify-between gap-2.5 rounded-2xl border border-white/40 bg-[#181818]/95 px-3.5 py-2.5 text-white shadow-spatial-card backdrop-blur-md"
           >
             <div className="flex items-start gap-2 min-w-0">
               <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0 text-white" />
@@ -2768,9 +2923,9 @@ export default function App() {
           </div>
         )}
 
-        {/* Visible Status Toast */}
+        {/* Visible Status Toast (always above modals) */}
         {appStatus && !appError && (
-          <div className="shrink-0 flex items-center justify-between gap-2.5 border-b border-white/25 bg-[#121212] px-3.5 py-2 text-white z-40">
+          <div className="fixed top-2 left-1/2 z-[70] flex w-[calc(100%-1.5rem)] max-w-[456px] -translate-x-1/2 items-center justify-between gap-2.5 rounded-2xl border border-white/30 bg-[#121212]/95 px-3.5 py-2 text-white shadow-spatial-card backdrop-blur-md">
             <div className="flex items-center gap-2 min-w-0">
               <Check className="h-3.5 w-3.5 shrink-0 text-white" />
               <p className="text-xs font-medium truncate">{appStatus}</p>
@@ -2811,22 +2966,26 @@ export default function App() {
         </div>
 
         {/* ?add=username Auto-Popup 3D Profile Preview Card */}
-        {isProtectedSessionReady && inviteModalUser && (
-          <ContactPreviewCard
-            isModal
-            user={inviteModalUser}
-            relationship={getRelationship(inviteModalUser.uid)}
-            loading={busyActionId === getPairId(myProfile.uid, inviteModalUser.uid)}
-            statusMessage={contactStatusMessage}
-            onAddContact={handleAddContact}
-            onAcceptRequest={handleAcceptRequest}
-            onOpenChat={openDirectChat}
-            onClose={() => {
-              setInviteModalUser(null);
-              setContactStatusMessage('');
-            }}
-          />
-        )}
+        {isProtectedSessionReady && inviteModalUser && (() => {
+          const currentUid = String(authUser?.uid || myProfile?.uid || '');
+          const inviteUid = String(inviteModalUser.uid || inviteModalUser.id || '');
+          return (
+            <ContactPreviewCard
+              isModal
+              user={inviteModalUser}
+              relationship={getRelationship(inviteUid)}
+              loading={Boolean(inviteUid) && busyActionId === getPairId(currentUid, inviteUid)}
+              statusMessage={contactStatusMessage}
+              onAddContact={handleAddContact}
+              onAcceptRequest={handleAcceptRequest}
+              onOpenChat={openDirectChat}
+              onClose={() => {
+                setInviteModalUser(null);
+                setContactStatusMessage('');
+              }}
+            />
+          );
+        })()}
 
         {/* Profile Studio 3D Slide-up Drawer */}
         {isProtectedSessionReady && (
@@ -3102,15 +3261,23 @@ export default function App() {
                     </div>
                   ) : (
                     filteredDirectory.map((u) => {
-                      const isSelf = u.uid === myProfile?.uid;
-                      const isBusy = ownerActionUid === u.uid;
-                      const draftVal = badgeDrafts[u.uid] ?? u.badge ?? '';
+                      const targetUid = String(u.uid || u.id || '');
+                      const isSelf = targetUid === myProfile?.uid;
+                      const isBusy = ownerActionUid === targetUid;
+                      const draftVal = badgeDrafts[targetUid] ?? u.badge ?? '';
                       const isTargetAdmin = hasAdminAccess(u, OWNER_UID);
-                      const roleLabel = (u.role || (isTargetAdmin ? 'admin' : 'user')).toUpperCase();
+                      const currentRole =
+                        u.role === 'owner' || u.role === 'superadmin' || u.role === 'admin'
+                          ? u.role
+                          : isTargetAdmin
+                          ? 'admin'
+                          : 'user';
+                      const roleLabel = currentRole.toUpperCase();
+                      const isConfirmingDelete = confirmDeleteUid === targetUid;
 
                       return (
                         <div
-                          key={u.uid}
+                          key={targetUid}
                           className="rounded-xl border border-white/14 bg-[#121212] p-3 space-y-2.5"
                         >
                           <div className="flex items-start justify-between gap-2">
@@ -3144,27 +3311,25 @@ export default function App() {
                                 </div>
                               )}
                               <div className="mt-0.5 truncate font-mono text-[10px] text-white/35">
-                                UID: {u.uid}
+                                UID: {targetUid}
                               </div>
                             </div>
 
-                            <div className="flex shrink-0 items-center gap-1.5">
-                              <button
-                                type="button"
-                                disabled={(isSelf && isTargetAdmin) || isBusy}
-                                onClick={() =>
-                                  handleUpdateUserRole(u, isTargetAdmin ? 'user' : 'admin')
-                                }
-                                className={`flex items-center gap-1 rounded-lg border px-2.5 py-1.5 text-[10.5px] font-semibold transition disabled:opacity-35 ${
-                                  isTargetAdmin
-                                    ? 'border-white bg-white text-black'
-                                    : 'border-white/25 bg-black text-white hover:bg-white hover:text-black'
-                                }`}
-                                title={isTargetAdmin ? 'Demote to user' : 'Promote to admin'}
+                            <div className="flex shrink-0 flex-wrap items-center justify-end gap-1.5">
+                              <select
+                                aria-label={`Change role for ${u.usernameLower || targetUid}`}
+                                disabled={isBusy}
+                                value={currentRole}
+                                onChange={(e) => handleUpdateUserRole(u, e.target.value)}
+                                className="rounded-lg border border-white/25 bg-black px-2 py-1.5 font-mono text-[10.5px] font-semibold text-white focus:border-white focus:outline-none disabled:opacity-40"
                               >
-                                <UserCheck className="h-3 w-3" />
-                                <span>{isTargetAdmin ? 'Admin' : 'Promote'}</span>
-                              </button>
+                                <option value="user" disabled={isSelf && isTargetAdmin}>
+                                  user
+                                </option>
+                                <option value="admin">admin</option>
+                                <option value="superadmin">superadmin</option>
+                                <option value="owner">owner</option>
+                              </select>
 
                               <button
                                 type="button"
@@ -3180,6 +3345,29 @@ export default function App() {
                                 <Ban className="h-3 w-3" />
                                 <span>{u.isBanned ? 'Unban' : 'Ban'}</span>
                               </button>
+
+                              {!isSelf && (
+                                <button
+                                  type="button"
+                                  disabled={isBusy}
+                                  onClick={() => {
+                                    if (isConfirmingDelete) {
+                                      handleDeleteUser(u);
+                                    } else {
+                                      setConfirmDeleteUid(targetUid);
+                                    }
+                                  }}
+                                  className={`flex items-center gap-1 rounded-lg border px-2.5 py-1.5 text-[10.5px] font-semibold transition disabled:opacity-35 ${
+                                    isConfirmingDelete
+                                      ? 'border-white bg-white text-black'
+                                      : 'border-white/25 bg-black text-white/80 hover:border-white hover:text-white'
+                                  }`}
+                                  title="Delete user document"
+                                >
+                                  <Trash2 className="h-3 w-3" />
+                                  <span>{isConfirmingDelete ? 'Confirm' : 'Delete'}</span>
+                                </button>
+                              )}
                             </div>
                           </div>
 
@@ -3193,7 +3381,7 @@ export default function App() {
                                 onChange={(e) =>
                                   setBadgeDrafts((prev) => ({
                                     ...prev,
-                                    [u.uid]: e.target.value.slice(0, 16),
+                                    [targetUid]: e.target.value.slice(0, 16),
                                   }))
                                 }
                                 placeholder="Badge (e.g. OWNER, FAMILY)"
@@ -3203,7 +3391,7 @@ export default function App() {
                             <button
                               type="button"
                               disabled={isBusy}
-                              onClick={() => handleAssignBadge(u.uid, draftVal)}
+                              onClick={() => handleAssignBadge(targetUid, draftVal)}
                               className="flex items-center gap-1 rounded-lg bg-white px-2.5 py-1.5 text-[10.5px] font-semibold text-black transition active:scale-95 disabled:opacity-40"
                             >
                               <Check className="h-3 w-3" />
@@ -3218,8 +3406,8 @@ export default function App() {
                                 type="button"
                                 disabled={isBusy}
                                 onClick={() => {
-                                  setBadgeDrafts((prev) => ({ ...prev, [u.uid]: preset }));
-                                  handleAssignBadge(u.uid, preset);
+                                  setBadgeDrafts((prev) => ({ ...prev, [targetUid]: preset }));
+                                  handleAssignBadge(targetUid, preset);
                                 }}
                                 className="rounded-md border border-white/14 bg-black px-2 py-0.5 font-mono text-[9.5px] text-white/65 hover:border-white/40 hover:text-white transition"
                               >
@@ -3306,8 +3494,20 @@ export default function App() {
                 )}
 
                 <div className="space-y-1.5">
-                  <div className="font-mono text-[10px] uppercase tracking-wider text-white/45">
-                    Recent Admin Audit Logs
+                  <div className="flex items-center justify-between gap-2">
+                    <div className="font-mono text-[10px] uppercase tracking-wider text-white/45">
+                      Recent Admin Audit Logs
+                    </div>
+                    {ownerLogs.length > 0 && (
+                      <button
+                        type="button"
+                        onClick={handleClearAdminLogs}
+                        className="flex items-center gap-1 rounded-lg border border-white/20 bg-[#121212] px-2.5 py-1 text-[10px] font-medium text-white/80 hover:border-white hover:text-white transition"
+                      >
+                        <Trash2 className="h-3 w-3" />
+                        <span>Clear Logs</span>
+                      </button>
+                    )}
                   </div>
                   {ownerLogs.length === 0 ? (
                     <div className="rounded-xl border border-white/10 bg-[#121212] py-3 text-center text-[11px] text-white/40">
