@@ -53,6 +53,20 @@ export function isValidUsername(username) {
   return typeof username === 'string' && USERNAME_REGEX.test(username);
 }
 
+export const PRIVILEGED_ROLES = new Set(['owner', 'admin', 'superadmin']);
+
+export function hasAdminAccess(userDoc, ownerUid = '', hasAdminDoc = false) {
+  if (hasAdminDoc) return true;
+  if (!userDoc) return false;
+  const role = typeof userDoc.role === 'string' ? userDoc.role.trim().toLowerCase() : '';
+  return (
+    PRIVILEGED_ROLES.has(role) ||
+    userDoc.isAdmin === true ||
+    userDoc.isOwner === true ||
+    Boolean(ownerUid && userDoc.uid === ownerUid)
+  );
+}
+
 /**
  * Create an in-memory sliding-window + minimum-cooldown rate limiter.
  */

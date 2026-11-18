@@ -39,19 +39,21 @@ import {
   Shield,
   Sparkles,
   Tag,
+  Trash2,
   UserCheck,
   UserPlus,
   Users,
   Video,
   X,
 } from 'lucide-react';
-import { auth, db, googleProvider, isFirebaseConfigured, rtdb } from './firebase';
+import { OWNER_UID, auth, db, googleProvider, isFirebaseConfigured, rtdb } from './firebase';
 import {
   MAX_BIO_LENGTH,
   MAX_GROUP_NAME_LENGTH,
   MAX_MESSAGE_LENGTH,
   MAX_NICKNAME_LENGTH,
   createRateLimiter,
+  hasAdminAccess,
   isValidUsername,
   sanitizePlainText,
 } from './utils/security';
@@ -123,7 +125,6 @@ export default function App() {
   const [outgoingPendingReqs, setOutgoingPendingReqs] = useState([]);
   const [acceptedFromReqs, setAcceptedFromReqs] = useState([]);
   const [acceptedToReqs, setAcceptedToReqs] = useState([]);
-  const [legacyRequests, setLegacyRequests] = useState([]);
   const [userContactsDocs, setUserContactsDocs] = useState([]);
   const [userProfilesMap, setUserProfilesMap] = useState({});
   const [directChatsMap, setDirectChatsMap] = useState({});
@@ -142,13 +143,19 @@ export default function App() {
   const [busyActionId, setBusyActionId] = useState('');
   const [activeTab, setActiveTab] = useState('all'); // 'all' | 'direct' | 'groups'
 
-  // Global App Config (config/appState) & Dismissible Banner
+  // Global App Config (config/appState) & Dismissible Banner (persisted in localStorage)
   const [appState, setAppState] = useState({
-    announcement: { active: false, text: '' },
+    announcement: { id: '', active: false, text: '' },
     allowNewSignups: true,
     allowVideoCalls: true,
   });
-  const [dismissedBannerText, setDismissedBannerText] = useState('');
+  const [dismissedBannerId, setDismissedBannerId] = useState(() => {
+    try {
+      return window.localStorage.getItem('voliud_dismissed_announcement_id') || '';
+    } catch {
+      return '';
+    }
+  });
 
   // Owner / Admin Console (Spark-plan friendly on-demand queries)
   const [ownerConsoleOpen, setOwnerConsoleOpen] = useState(false);
@@ -253,13 +260,13 @@ export default function App() {
         if (snap.exists()) {
           const data = snap.data();
           const isActive = Boolean(data.announcement?.active);
-          if (!isActive) {
-            setDismissedBannerText('');
-          }
+          const annText = data.announcement?.text || '';
+          const annId = data.announcement?.id || (annText.trim() ? `ann_${annText.trim()}` : '');
           setAppState({
             announcement: {
+              id: annId,
               active: isActive,
-              text: data.announcement?.text || '',
+              text: annText,
             },
             allowNewSignups: data.allowNewSignups !== false,
             allowVideoCalls: data.allowVideoCalls !== false,
@@ -308,13 +315,38 @@ export default function App() {
     return () => unsub();
   }, [syncUserProfileOnLogin]);
 
-  // Subscribe to live users/{uid} document; derive admin strictly from role === 'admin' || isAdmin === true
+  // Subscribe to live users/{uid} document; grant admin/owner access for role === 'owner'|'admin'|'superadmin', isAdmin, isOwner, OWNER_UID, or admins/{uid}
   useEffect(() => {
     if (!isFirebaseConfigured || !db || !authUser) return;
+
+    let cancelled = false;
+    let hasAdminDoc = false;
+    let latestUserData = null;
 
     setProfileLoading(true);
     setAdminVerified(false);
     setIsOwnerAdmin(false);
+
+    const evaluateAdmin = () => {
+      if (cancelled) return;
+      const verifiedAdmin = hasAdminAccess(
+        latestUserData || { uid: authUser.uid },
+        OWNER_UID,
+        hasAdminDoc
+      );
+      setIsOwnerAdmin(verifiedAdmin);
+      setAdminVerified(true);
+      if (!verifiedAdmin) setOwnerConsoleOpen(false);
+    };
+
+    getDoc(doc(db, 'admins', authUser.uid))
+      .then((snap) => {
+        hasAdminDoc = snap.exists();
+        evaluateAdmin();
+      })
+      .catch(() => {
+        evaluateAdmin();
+      });
 
     const userDocRef = doc(db, 'users', authUser.uid);
     const unsubUser = onSnapshot(
@@ -322,34 +354,30 @@ export default function App() {
       (snap) => {
         if (snap.exists()) {
           const data = { uid: snap.id, ...snap.data() };
+          latestUserData = data;
           setMyProfile(data);
-          const verifiedAdmin = data.role === 'admin' || data.isAdmin === true;
-          setIsOwnerAdmin(verifiedAdmin);
-          setAdminVerified(true);
-          if (!verifiedAdmin) setOwnerConsoleOpen(false);
         } else {
+          latestUserData = null;
           setMyProfile(null);
-          setIsOwnerAdmin(false);
-          setAdminVerified(true);
-          setOwnerConsoleOpen(false);
         }
+        evaluateAdmin();
         setProfileLoading(false);
       },
       (err) => {
         setProfileLoading(false);
-        setIsOwnerAdmin(false);
-        setAdminVerified(true);
+        evaluateAdmin();
         showAppError('User profile listener failed', err);
       }
     );
 
     return () => {
+      cancelled = true;
       unsubUser();
     };
   }, [authUser, showAppError]);
 
   // ---------------------------------------------------------------------------
-  // 2. Social Graph Listeners (Contact Requests, Contacts, Direct Chats, Groups)
+  // 2. Social Graph Listeners (Unified contactRequests, Contacts, Direct Chats, Groups)
   // ---------------------------------------------------------------------------
   useEffect(() => {
     if (!isFirebaseConfigured || !db || !myProfile?.uid) return;
@@ -414,18 +442,6 @@ export default function App() {
       (err) => showAppError('Accepted requests (outgoing) listener failed', err)
     );
 
-    const legacyReqQuery = query(
-      collection(db, 'contactRequests'),
-      where('participants', 'array-contains', myUid)
-    );
-    const unsubLegacyReqs = onSnapshot(
-      legacyReqQuery,
-      (snap) => {
-        setLegacyRequests(snap.docs.map((d) => ({ id: d.id, ...d.data() })));
-      },
-      (err) => showAppError('Legacy requests listener failed', err)
-    );
-
     const contactsSubRef = collection(db, 'users', myUid, 'contacts');
     const unsubContacts = onSnapshot(
       contactsSubRef,
@@ -474,14 +490,13 @@ export default function App() {
       unsubOutgoing();
       unsubAcceptedTo();
       unsubAcceptedFrom();
-      unsubLegacyReqs();
       unsubContacts();
       unsubChats();
       unsubGroups();
     };
   }, [myProfile?.uid, showAppError]);
 
-  // Unified view of contact requests across new and legacy schemas
+  // Unified view of contactRequests collection
   const contactRequests = useMemo(() => {
     const byId = new Map();
     [
@@ -489,12 +504,11 @@ export default function App() {
       ...outgoingPendingReqs,
       ...acceptedToReqs,
       ...acceptedFromReqs,
-      ...legacyRequests,
     ].forEach((r) => {
       if (r?.id) byId.set(r.id, r);
     });
     return Array.from(byId.values());
-  }, [incomingPendingReqs, outgoingPendingReqs, acceptedToReqs, acceptedFromReqs, legacyRequests]);
+  }, [incomingPendingReqs, outgoingPendingReqs, acceptedToReqs, acceptedFromReqs]);
 
   // Keep live user profiles synced for accepted contacts + group members
   useEffect(() => {
@@ -1131,9 +1145,11 @@ export default function App() {
     setAnnouncementSaving(true);
     setOwnerError('');
     setOwnerNotice('');
+    const cleanText = (announcementTextDraft || '').trim().slice(0, 180);
     const nextAnnouncement = {
-      active: Boolean(announcementActiveDraft),
-      text: (announcementTextDraft || '').trim().slice(0, 180),
+      id: cleanText ? `ann_${Date.now()}` : '',
+      active: Boolean(announcementActiveDraft && cleanText),
+      text: cleanText,
       updatedBy: myProfile?.uid || authUser?.uid || '',
     };
     try {
@@ -1159,6 +1175,43 @@ export default function App() {
       setOwnerNotice('Saved Global Announcement to config/appState.');
     } catch (err) {
       setOwnerError(`Save announcement failed: ${formatFirestoreError(err)}`);
+    } finally {
+      setAnnouncementSaving(false);
+    }
+  };
+
+  const handleClearAnnouncement = async () => {
+    if (!isOwnerAdmin) return;
+    setAnnouncementSaving(true);
+    setOwnerError('');
+    setOwnerNotice('');
+    const cleared = {
+      id: '',
+      active: false,
+      text: '',
+      updatedBy: myProfile?.uid || authUser?.uid || '',
+    };
+    try {
+      setAnnouncementActiveDraft(false);
+      setAnnouncementTextDraft('');
+      if (demoMode) {
+        setAppState((prev) => ({ ...prev, announcement: cleared }));
+        setOwnerNotice('Cleared active announcement (preview).');
+        return;
+      }
+      if (!db) throw new Error('Firestore is not initialized.');
+      await setDoc(
+        doc(db, 'config', 'appState'),
+        {
+          announcement: { ...cleared, updatedAt: serverTimestamp() },
+          updatedAt: serverTimestamp(),
+        },
+        { merge: true }
+      );
+      await appendAdminLog('announcement_clear', 'config/appState', 'Cleared active announcement');
+      setOwnerNotice('Deleted / cleared active announcement.');
+    } catch (err) {
+      setOwnerError(`Clear announcement failed: ${formatFirestoreError(err)}`);
     } finally {
       setAnnouncementSaving(false);
     }
@@ -1229,12 +1282,20 @@ export default function App() {
 
   const handleUpdateUserRole = async (targetUser, nextRole) => {
     if (!isOwnerAdmin || !targetUser?.uid) return;
-    if (targetUser.uid === myProfile?.uid && nextRole !== 'admin') {
-      setOwnerError('You cannot remove admin role from your own active session.');
+    const cleanRole =
+      nextRole === 'owner'
+        ? 'owner'
+        : nextRole === 'superadmin'
+        ? 'superadmin'
+        : nextRole === 'admin'
+        ? 'admin'
+        : 'user';
+    if (targetUser.uid === myProfile?.uid && cleanRole === 'user') {
+      setOwnerError('You cannot remove admin/owner role from your own active session.');
       return;
     }
-    const cleanRole = nextRole === 'admin' ? 'admin' : 'user';
-    const nextIsAdmin = cleanRole === 'admin';
+    const nextIsAdmin = cleanRole === 'admin' || cleanRole === 'owner' || cleanRole === 'superadmin';
+    const nextIsOwner = cleanRole === 'owner';
     setOwnerActionUid(targetUser.uid);
     setOwnerError('');
     setOwnerNotice('');
@@ -1242,7 +1303,9 @@ export default function App() {
       if (demoMode) {
         setOwnerDirectory((prev) =>
           prev.map((u) =>
-            u.uid === targetUser.uid ? { ...u, role: cleanRole, isAdmin: nextIsAdmin } : u
+            u.uid === targetUser.uid
+              ? { ...u, role: cleanRole, isAdmin: nextIsAdmin, isOwner: nextIsOwner }
+              : u
           )
         );
         setOwnerNotice(`Updated role=${cleanRole} on users/${targetUser.uid} (preview).`);
@@ -1252,12 +1315,15 @@ export default function App() {
       await updateDoc(doc(db, 'users', targetUser.uid), {
         role: cleanRole,
         isAdmin: nextIsAdmin,
+        isOwner: nextIsOwner,
         updatedAt: serverTimestamp(),
       });
       await appendAdminLog('role_update', targetUser.uid, `role=${cleanRole}`);
       setOwnerDirectory((prev) =>
         prev.map((u) =>
-          u.uid === targetUser.uid ? { ...u, role: cleanRole, isAdmin: nextIsAdmin } : u
+          u.uid === targetUser.uid
+            ? { ...u, role: cleanRole, isAdmin: nextIsAdmin, isOwner: nextIsOwner }
+            : u
         )
       );
       setOwnerNotice(`Updated role to ${cleanRole} on users/${targetUser.uid}.`);
@@ -2361,6 +2427,18 @@ export default function App() {
             </div>
 
             <div className="flex items-center gap-2.5 shrink-0">
+              {isVerifiedAdmin && (
+                <button
+                  type="button"
+                  onClick={openOwnerConsole}
+                  className="flex h-10 w-10 items-center justify-center rounded-full border border-white/30 bg-white text-black shadow-spatial-white transition hover:bg-white/90"
+                  title="Owner / Admin Control Panel"
+                  aria-label="Open Owner / Admin Control Panel"
+                >
+                  <Shield className="h-4 w-4" />
+                </button>
+              )}
+
               <button
                 type="button"
                 onClick={() => setNewGroupOpen(true)}
@@ -2635,10 +2713,24 @@ export default function App() {
     authReady && !profileLoading && Boolean(authUser || demoMode) && Boolean(myProfile);
   const isVerifiedAdmin = isProtectedSessionReady && adminVerified && isOwnerAdmin;
 
+  const currentAnnouncementId =
+    appState.announcement?.id ||
+    (appState.announcement?.text?.trim() ? `ann_${appState.announcement.text.trim()}` : '');
+
   const showGlobalBanner =
     Boolean(appState.announcement?.active) &&
     Boolean(appState.announcement?.text?.trim()) &&
-    dismissedBannerText !== appState.announcement.text.trim();
+    dismissedBannerId !== currentAnnouncementId;
+
+  const handleDismissAnnouncementBanner = () => {
+    if (!currentAnnouncementId) return;
+    setDismissedBannerId(currentAnnouncementId);
+    try {
+      window.localStorage.setItem('voliud_dismissed_announcement_id', currentAnnouncementId);
+    } catch {
+      // Ignore storage quota / private-mode restrictions
+    }
+  };
 
   const filteredDirectory = ownerDirectory.filter((u) => {
     const q = ownerSearch.trim().toLowerCase();
@@ -2705,7 +2797,7 @@ export default function App() {
             </div>
             <button
               type="button"
-              onClick={() => setDismissedBannerText(appState.announcement.text.trim())}
+              onClick={handleDismissAnnouncementBanner}
               className="flex h-6 w-6 shrink-0 items-center justify-center rounded-full border border-black/15 bg-black/5 text-black hover:bg-black/15 transition"
               aria-label="Dismiss announcement"
             >
@@ -2895,17 +2987,28 @@ export default function App() {
                   className="w-full rounded-xl border border-white/16 bg-[#121212] px-3 py-2 text-xs text-white placeholder:text-white/30 focus:border-white focus:outline-none"
                 />
 
-                <div className="flex items-center justify-between gap-2">
+                <div className="flex flex-wrap items-center justify-between gap-2">
                   <span className="font-mono text-[10px] text-white/40">
                     config/appState • {announcementActiveDraft ? 'Active' : 'Hidden'}
                   </span>
-                  <button
-                    type="submit"
-                    disabled={announcementSaving}
-                    className="rounded-xl bg-white px-3.5 py-1.5 text-xs font-semibold text-black shadow-spatial-white transition active:scale-95 disabled:opacity-50"
-                  >
-                    {announcementSaving ? 'Saving...' : 'Publish Banner'}
-                  </button>
+                  <div className="flex items-center gap-2">
+                    <button
+                      type="button"
+                      disabled={announcementSaving}
+                      onClick={handleClearAnnouncement}
+                      className="flex items-center gap-1 rounded-xl border border-white/25 bg-[#121212] px-3 py-1.5 text-xs font-medium text-white/85 hover:border-white hover:text-white transition active:scale-95 disabled:opacity-50"
+                    >
+                      <Trash2 className="h-3.5 w-3.5" />
+                      <span>Delete / Clear Active Announcement</span>
+                    </button>
+                    <button
+                      type="submit"
+                      disabled={announcementSaving}
+                      className="rounded-xl bg-white px-3.5 py-1.5 text-xs font-semibold text-black shadow-spatial-white transition active:scale-95 disabled:opacity-50"
+                    >
+                      {announcementSaving ? 'Saving...' : 'Publish Banner'}
+                    </button>
+                  </div>
                 </div>
               </form>
 
@@ -3002,7 +3105,8 @@ export default function App() {
                       const isSelf = u.uid === myProfile?.uid;
                       const isBusy = ownerActionUid === u.uid;
                       const draftVal = badgeDrafts[u.uid] ?? u.badge ?? '';
-                      const isTargetAdmin = u.role === 'admin' || u.isAdmin === true;
+                      const isTargetAdmin = hasAdminAccess(u, OWNER_UID);
+                      const roleLabel = (u.role || (isTargetAdmin ? 'admin' : 'user')).toUpperCase();
 
                       return (
                         <div
@@ -3021,7 +3125,7 @@ export default function App() {
                                   </span>
                                 )}
                                 <span className="rounded-full border border-white/25 bg-black px-2 py-0.5 font-mono text-[9px] font-semibold uppercase tracking-wider text-white/80">
-                                  {isTargetAdmin ? 'ADMIN' : 'USER'}
+                                  {roleLabel}
                                 </span>
                                 {u.badge && (
                                   <span className="rounded-full border border-white/30 bg-white/10 px-2 py-0.5 font-mono text-[9px] font-semibold uppercase tracking-wider text-white">
