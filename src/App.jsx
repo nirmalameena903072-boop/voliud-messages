@@ -213,9 +213,6 @@ export default function App() {
   const messageLimiterRef = useRef(
     createRateLimiter({ minIntervalMs: 600, maxHits: 8, windowMs: 10000, label: 'Messaging' })
   );
-  const contactRequestLimiterRef = useRef(
-    createRateLimiter({ minIntervalMs: 3000, maxHits: 5, windowMs: 60000, label: 'Contact requests' })
-  );
   const groupCreateLimiterRef = useRef(
     createRateLimiter({ minIntervalMs: 5000, maxHits: 3, windowMs: 60000, label: 'Group creation' })
   );
@@ -261,14 +258,18 @@ export default function App() {
     try {
       const snap = await getDoc(userRef);
       if (!snap.exists()) {
-        await setDoc(userRef, {
-          uid: user.uid,
-          email: normalizedEmail,
-          displayName,
-          photoURL,
-          role: 'user',
-          createdAt: serverTimestamp(),
-        });
+        await setDoc(
+          userRef,
+          {
+            uid: user.uid,
+            email: normalizedEmail,
+            displayName,
+            photoURL,
+            role: 'user',
+            createdAt: serverTimestamp(),
+          },
+          { merge: true }
+        );
       } else {
         await setDoc(
           userRef,
@@ -1714,7 +1715,7 @@ export default function App() {
           },
           ...prev,
         ]);
-        openModalPopup('Report Submitted', 'Your report has been sent to the Admin.', 'success');
+        openModalPopup('Report Submitted', 'Your report has been submitted to the Admin.', 'success');
         return true;
       }
 
@@ -1736,7 +1737,7 @@ export default function App() {
         createdAt: serverTimestamp(),
       });
 
-      openModalPopup('Report Submitted', 'Your report has been sent to the Admin.', 'success');
+      openModalPopup('Report Submitted', 'Your report has been submitted to the Admin.', 'success');
       return true;
     } catch (err) {
       const exactErr = formatFirestoreError(err, 'Unable to submit report.');
@@ -1815,14 +1816,6 @@ export default function App() {
         return;
       }
 
-      const gate = contactRequestLimiterRef.current.check();
-      if (!gate.allowed) {
-        setSearchError(gate.message);
-        setContactStatusMessage(gate.message);
-        openModalPopup('Please Wait', gate.message, 'error');
-        return;
-      }
-
       const pairId = getPairId(senderUid, targetUid);
       setBusyActionId(pairId);
       setSearchError('');
@@ -1839,7 +1832,11 @@ export default function App() {
         );
         if (existingPending) {
           setContactStatusMessage('Request already pending');
-          openModalPopup('Request Pending', 'A request is already pending for this user.', 'info');
+          openModalPopup(
+            'Request Pending',
+            'A contact request is already pending for this user.',
+            'info'
+          );
           return;
         }
         openModalPopup('Contact Request', 'Sending contact request...', 'loading');
@@ -1887,7 +1884,11 @@ export default function App() {
 
       if (alreadyPending) {
         setContactStatusMessage('Request already pending');
-        openModalPopup('Request Pending', 'A request is already pending for this user.', 'info');
+        openModalPopup(
+          'Request Pending',
+          'A contact request is already pending for this user.',
+          'info'
+        );
         return;
       }
 
@@ -2094,7 +2095,7 @@ export default function App() {
   const sendMessagePayload = async (payload) => {
     if (!activeChat || !myProfile || myProfile.isBanned) return false;
 
-    const gate = messageLimiterRef.current.check();
+    const gate = messageLimiterRef.current();
     if (!gate.allowed) {
       showRateNotice(gate.message);
       return false;
@@ -2322,7 +2323,7 @@ export default function App() {
   // ---------------------------------------------------------------------------
   const handleCreateGroup = async ({ name, memberUids, familyMode }) => {
     if (!myProfile) return;
-    const gate = groupCreateLimiterRef.current.check();
+    const gate = groupCreateLimiterRef.current();
     if (!gate.allowed) {
       throw new Error(gate.message);
     }
