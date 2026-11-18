@@ -167,8 +167,9 @@ export default function App() {
     }
   });
 
-  // Owner / Admin Console (Spark-plan friendly on-demand queries)
+  // Owner / Admin Console (Spark-plan friendly on-demand queries + real-time reports)
   const [ownerConsoleOpen, setOwnerConsoleOpen] = useState(false);
+  const [ownerTab, setOwnerTab] = useState('users'); // 'users' | 'reports' | 'logs'
   const [ownerStats, setOwnerStats] = useState({ users: null, groups: null });
   const [ownerDirectory, setOwnerDirectory] = useState([]);
   const [ownerLastDoc, setOwnerLastDoc] = useState(null);
@@ -185,6 +186,7 @@ export default function App() {
   const [badgeDrafts, setBadgeDrafts] = useState({});
   const [ownerActionUid, setOwnerActionUid] = useState('');
   const [confirmDeleteUid, setConfirmDeleteUid] = useState('');
+  const [modalPopup, setModalPopup] = useState(null); // { title, message, tone }
 
   // Demo sandbox data store
   const [demoMessagesByChat, setDemoMessagesByChat] = useState({});
@@ -234,6 +236,10 @@ export default function App() {
     },
     [showAppStatus]
   );
+
+  const openModalPopup = useCallback((title, message, tone = 'info') => {
+    setModalPopup({ title, message, tone });
+  }, []);
 
   const syncUserProfileOnLogin = useCallback(async (user) => {
     if (!isFirebaseConfigured || !db || !user?.uid) return null;
@@ -521,6 +527,28 @@ export default function App() {
       unsubGroups();
     };
   }, [myProfile?.uid, showAppError]);
+
+  // Real-time Admin Reports listener when Owner/Admin Console is open
+  useEffect(() => {
+    if (!isFirebaseConfigured || !db || demoMode || !ownerConsoleOpen || !adminVerified || !isOwnerAdmin) {
+      return;
+    }
+
+    const unsubReports = onSnapshot(
+      collection(db, 'reports'),
+      (snap) => {
+        const list = snap.docs
+          .map((d) => ({ id: d.id, ...d.data() }))
+          .sort((a, b) => getMillis(b.createdAt) - getMillis(a.createdAt));
+        setOwnerReports(list);
+      },
+      (err) => {
+        reportOwnerError(err, 'Reports real-time listener failed.');
+      }
+    );
+
+    return () => unsubReports();
+  }, [demoMode, ownerConsoleOpen, adminVerified, isOwnerAdmin, reportOwnerError]);
 
   // Unified view of contactRequests collection
   const contactRequests = useMemo(() => {
@@ -1090,9 +1118,9 @@ export default function App() {
       const [uRes, gRes, dirRes, logsRes, reportsRes] = await Promise.allSettled([
         getCountFromServer(collection(db, 'users')),
         getCountFromServer(collection(db, 'groups')),
-        getDocs(query(collection(db, 'users'), limit(25))),
-        getDocs(query(collection(db, 'adminLogs'), limit(25))),
-        getDocs(query(collection(db, 'reports'), limit(25))),
+        getDocs(collection(db, 'users')),
+        getDocs(query(collection(db, 'adminLogs'), limit(50))),
+        getDocs(collection(db, 'reports')),
       ]);
 
       setOwnerStats({
@@ -1112,8 +1140,8 @@ export default function App() {
             (a.usernameLower || a.email || a.uid).localeCompare(b.usernameLower || b.email || b.uid)
           );
         setOwnerDirectory(usersList);
-        setOwnerLastDoc(snap.docs[snap.docs.length - 1] || null);
-        setOwnerHasMore(snap.docs.length === 25);
+        setOwnerLastDoc(null);
+        setOwnerHasMore(false);
         const drafts = {};
         usersList.forEach((u) => {
           drafts[u.uid] = u.badge || '';
@@ -1494,6 +1522,13 @@ export default function App() {
     setOwnerError('');
     setOwnerNotice('');
     try {
+      if (demoMode) {
+        setOwnerReports((prev) =>
+          prev.map((r) => (r.id === reportId ? { ...r, status: cleanStatus } : r))
+        );
+        reportOwnerSuccess(`Marked report ${reportId} as ${cleanStatus} (preview).`);
+        return;
+      }
       if (!db) throw new Error('Firestore is not initialized.');
       await updateDoc(doc(db, 'reports', String(reportId)), {
         status: cleanStatus,
@@ -1507,6 +1542,72 @@ export default function App() {
       reportOwnerSuccess(`Marked report ${reportId} as ${cleanStatus}.`);
     } catch (err) {
       reportOwnerError(err, 'Report update failed.');
+    }
+  };
+
+  const handleBanReportedUser = async (report) => {
+    if (!isOwnerAdmin || !report) return;
+    const targetUid = String(report.reportedUserId || report.reportedUid || '');
+    if (!targetUid) {
+      reportOwnerError(new Error('Missing reported user ID on this report.'));
+      return;
+    }
+    if (targetUid === myProfile?.uid) {
+      reportOwnerError(new Error('You cannot ban your own active admin account.'));
+      return;
+    }
+    setOwnerActionUid(targetUid);
+    setOwnerError('');
+    setOwnerNotice('');
+    try {
+      if (demoMode) {
+        setOwnerDirectory((prev) =>
+          prev.map((u) => ((u.uid || u.id) === targetUid ? { ...u, isBanned: true } : u))
+        );
+        reportOwnerSuccess(`Banned reported user ${targetUid} (preview).`);
+        return;
+      }
+      if (!db) throw new Error('Firestore is not initialized.');
+      await updateDoc(doc(db, 'users', targetUid), {
+        isBanned: true,
+        updatedAt: serverTimestamp(),
+      });
+      if (report.id) {
+        await updateDoc(doc(db, 'reports', String(report.id)), {
+          status: 'resolved',
+          reviewedBy: String(myProfile?.uid || authUser?.uid || ''),
+          updatedAt: serverTimestamp(),
+        }).catch(() => {});
+      }
+      await appendAdminLog('ban_reported_user', targetUid, `reportId=${String(report.id || '')}`);
+      setOwnerDirectory((prev) =>
+        prev.map((u) => ((u.uid || u.id) === targetUid ? { ...u, isBanned: true } : u))
+      );
+      reportOwnerSuccess(`Banned reported user users/${targetUid}.`);
+    } catch (err) {
+      reportOwnerError(err, `Failed to ban reported user (users/${targetUid}).`);
+    } finally {
+      setOwnerActionUid('');
+    }
+  };
+
+  const handleDeleteReport = async (reportId) => {
+    if (!isOwnerAdmin || !reportId) return;
+    setOwnerError('');
+    setOwnerNotice('');
+    try {
+      if (demoMode) {
+        setOwnerReports((prev) => prev.filter((r) => r.id !== reportId));
+        reportOwnerSuccess(`Deleted report ${reportId} (preview).`);
+        return;
+      }
+      if (!db) throw new Error('Firestore is not initialized.');
+      await deleteDoc(doc(db, 'reports', String(reportId)));
+      await appendAdminLog('report_delete', String(reportId), 'Deleted report');
+      setOwnerReports((prev) => prev.filter((r) => r.id !== reportId));
+      reportOwnerSuccess(`Deleted report ${reportId}.`);
+    } catch (err) {
+      reportOwnerError(err, 'Delete report failed.');
     }
   };
 
@@ -1527,6 +1628,65 @@ export default function App() {
       reportOwnerSuccess(`Cleared ${logsSnap.size} admin audit log${logsSnap.size === 1 ? '' : 's'}.`);
     } catch (err) {
       reportOwnerError(err, 'Clear admin logs failed.');
+    }
+  };
+
+  const handleReportContact = async ({ contactUser, reason, details }) => {
+    const currentUid = String(authUser?.uid || myProfile?.uid || '');
+    const reportedUid = String(contactUser?.uid || contactUser?.id || '');
+    if (!currentUid || !reportedUid) {
+      openModalPopup('Report Failed', 'Unable to identify contact user.', 'error');
+      return false;
+    }
+    try {
+      if (demoMode) {
+        setOwnerReports((prev) => [
+          {
+            id: `rep_${Date.now()}`,
+            reporterId: currentUid,
+            reporterUid: currentUid,
+            reporterName: String(myProfile?.displayName || myProfile?.nickname || ''),
+            reporterUsername: String(myProfile?.usernameLower || myProfile?.username || ''),
+            reportedUserId: reportedUid,
+            reportedUserName: String(contactUser?.displayName || contactUser?.nickname || ''),
+            reportedUsername: String(contactUser?.usernameLower || contactUser?.username || ''),
+            chatId: String(activeChat?.id || ''),
+            reason: String(reason || 'Other'),
+            details: String(details || '').trim(),
+            status: 'open',
+            createdAtMs: Date.now(),
+          },
+          ...prev,
+        ]);
+        openModalPopup('Report Submitted', 'Your report has been sent to the Admin.', 'success');
+        return true;
+      }
+
+      if (!db) throw new Error('Firestore is not initialized.');
+      await addDoc(collection(db, 'reports'), {
+        reporterId: currentUid,
+        reporterUid: currentUid,
+        reporterName: String(
+          authUser?.displayName || myProfile?.displayName || myProfile?.nickname || ''
+        ),
+        reporterUsername: String(myProfile?.usernameLower || myProfile?.username || ''),
+        reportedUserId: reportedUid,
+        reportedUserName: String(contactUser?.displayName || contactUser?.nickname || ''),
+        reportedUsername: String(contactUser?.usernameLower || contactUser?.username || ''),
+        chatId: String(activeChat?.id || ''),
+        reason: String(reason || 'Other'),
+        details: String(details || '').trim(),
+        status: 'open',
+        createdAt: serverTimestamp(),
+      });
+
+      openModalPopup('Report Submitted', 'Your report has been sent to the Admin.', 'success');
+      return true;
+    } catch (err) {
+      const exactErr = formatFirestoreError(err, 'Unable to submit report.');
+      openModalPopup('Report Failed', exactErr, 'error');
+      setAppError(exactErr);
+      return false;
     }
   };
 
@@ -1582,17 +1742,17 @@ export default function App() {
     const currentUid = String(authUser?.uid || myProfile?.uid || '');
     const targetUid = String(targetUser?.uid || targetUser?.id || '');
     if (!currentUid || !targetUid) {
-      const failMsg = 'Failed: Unable to resolve user ID for contact request.';
+      const failMsg = 'Unable to resolve user ID for contact request.';
       setSearchError(failMsg);
       setContactStatusMessage(failMsg);
-      setAppError(failMsg);
+      openModalPopup('Request Failed', failMsg, 'error');
       return;
     }
 
     if (targetUid === currentUid) {
-      setSearchError('You cannot add yourself');
-      setContactStatusMessage('You cannot add yourself');
-      setAppError('You cannot add yourself');
+      setSearchError('You cannot add yourself.');
+      setContactStatusMessage('You cannot add yourself.');
+      openModalPopup('Action Not Allowed', 'You cannot send a contact request to yourself.', 'error');
       return;
     }
 
@@ -1600,7 +1760,7 @@ export default function App() {
     if (!gate.allowed) {
       setSearchError(gate.message);
       setContactStatusMessage(gate.message);
-      setAppError(gate.message);
+      openModalPopup('Please Wait', gate.message, 'error');
       return;
     }
 
@@ -1620,7 +1780,7 @@ export default function App() {
         );
         if (existingPending) {
           setContactStatusMessage('Request already pending');
-          showAppStatus('Request already pending');
+          openModalPopup('Request Pending', 'A request is already pending for this user.', 'info');
           return;
         }
         setContactRequests((prev) => [
@@ -1628,49 +1788,47 @@ export default function App() {
           {
             id: `req_${Date.now()}`,
             from: currentUid,
-            fromEmail: String(myProfile?.email || 'alex@example.com').trim().toLowerCase(),
             fromName: String(myProfile?.displayName || myProfile?.nickname || ''),
             fromUsername: String(myProfile?.usernameLower || myProfile?.username || ''),
+            fromEmail: String(myProfile?.email || 'alex@example.com').trim().toLowerCase(),
             to: targetUid,
-            toEmail: String(targetUser?.email || '').trim().toLowerCase(),
             toName: String(targetUser?.displayName || targetUser?.nickname || ''),
             toUsername: String(targetUser?.usernameLower || targetUser?.username || ''),
+            toEmail: String(targetUser?.email || '').trim().toLowerCase(),
             status: 'pending',
             createdAtMs: Date.now(),
           },
         ]);
         setContactStatusMessage('Contact request sent!');
-        showAppStatus('Contact request sent!');
+        openModalPopup(
+          'Request Sent',
+          'You have successfully sent the request. Please wait for them to accept or decline. Please be patient.',
+          'success'
+        );
         return;
       }
 
       if (!db) throw new Error('Firestore is not initialized.');
 
-      // Check Firestore for any existing pending request in either direction
-      const [outgoingSnap, incomingSnap] = await Promise.all([
-        getDocs(
-          query(
-            collection(db, 'contactRequests'),
-            where('from', '==', currentUid),
-            where('to', '==', targetUid),
-            where('status', '==', 'pending'),
-            limit(1)
-          )
-        ),
-        getDocs(
-          query(
-            collection(db, 'contactRequests'),
-            where('from', '==', targetUid),
-            where('to', '==', currentUid),
-            where('status', '==', 'pending'),
-            limit(1)
-          )
-        ),
+      // Query contactRequests where from == currentUid and check in JS if to === targetUid && status === 'pending'
+      // (Single-field index, never fails on missing composite index; also check incoming pending)
+      const [fromSnap, toSnap] = await Promise.all([
+        getDocs(query(collection(db, 'contactRequests'), where('from', '==', currentUid))),
+        getDocs(query(collection(db, 'contactRequests'), where('to', '==', currentUid))),
       ]);
 
-      if (!outgoingSnap.empty || !incomingSnap.empty) {
+      const outgoingPending = fromSnap.docs.some((d) => {
+        const data = d.data() || {};
+        return data.to === targetUid && data.status === 'pending';
+      });
+      const incomingPending = toSnap.docs.some((d) => {
+        const data = d.data() || {};
+        return data.from === targetUid && data.status === 'pending';
+      });
+
+      if (outgoingPending || incomingPending) {
         setContactStatusMessage('Request already pending');
-        showAppStatus('Request already pending');
+        openModalPopup('Request Pending', 'A request is already pending for this user.', 'info');
         return;
       }
 
@@ -1685,25 +1843,29 @@ export default function App() {
 
       await addDoc(collection(db, 'contactRequests'), {
         from: currentUid,
-        fromEmail,
         fromName,
         fromUsername,
+        fromEmail,
         to: targetUid,
-        toEmail,
         toName,
         toUsername,
+        toEmail,
         status: 'pending',
         createdAt: serverTimestamp(),
       });
 
       setContactStatusMessage('Contact request sent!');
-      showAppStatus('Contact request sent!');
+      openModalPopup(
+        'Request Sent',
+        'You have successfully sent the request. Please wait for them to accept or decline. Please be patient.',
+        'success'
+      );
     } catch (err) {
-      const baseMsg = `Failed: ${err?.message || 'Unable to send contact request.'}`;
-      const detailedMsg = err?.code ? `${baseMsg} (${err.code})` : baseMsg;
-      setSearchError(detailedMsg);
-      setContactStatusMessage(detailedMsg);
-      setAppError(detailedMsg);
+      const exactErr = formatFirestoreError(err, 'Unable to send contact request.');
+      setSearchError(exactErr);
+      setContactStatusMessage(exactErr);
+      setAppError(exactErr);
+      openModalPopup('Request Failed', exactErr, 'error');
     } finally {
       setBusyActionId('');
     }
@@ -2536,6 +2698,7 @@ export default function App() {
           onVotePoll={handleVotePoll}
           onTypingChange={handleTypingChange}
           onUpdateFamilyData={handleUpdateFamilyData}
+          onReportContact={handleReportContact}
         />
       );
     }
@@ -3086,7 +3249,7 @@ export default function App() {
                     <span>Total Users</span>
                   </div>
                   <div className="mt-1.5 font-mono text-2xl font-bold text-white">
-                    {ownerLoading && ownerStats.users === null ? '...' : ownerStats.users ?? '—'}
+                    {ownerLoading && ownerStats.users === null ? '...' : ownerStats.users ?? ownerDirectory.length}
                   </div>
                   <div className="mt-0.5 font-mono text-[9.5px] text-white/35">
                     getCountFromServer()
@@ -3110,393 +3273,486 @@ export default function App() {
                 </Tilt3DCard>
               </div>
 
-              {/* 1. Global Announcement Banner Editor (config/appState) */}
-              <form
-                onSubmit={handleSaveAnnouncement}
-                className="mt-5 rounded-2xl border border-white/16 bg-black p-4 space-y-3"
-              >
-                <div className="flex items-center justify-between">
-                  <div className="flex items-center gap-2">
-                    <Megaphone className="h-4 w-4 text-white" />
-                    <span className="text-xs font-semibold uppercase tracking-[0.15em] text-white">
-                      Global Announcement
-                    </span>
-                  </div>
+              {/* Admin Panel Navigation Tabs */}
+              <div className="mt-4 grid grid-cols-3 gap-1.5 rounded-2xl border border-white/14 bg-black p-1">
+                {[
+                  { id: 'users', label: `Controls & Users (${ownerDirectory.length})` },
+                  { id: 'reports', label: `Reports (${ownerReports.length})` },
+                  { id: 'logs', label: `Logs (${ownerLogs.length})` },
+                ].map((tab) => (
                   <button
+                    key={tab.id}
                     type="button"
-                    onClick={() => setAnnouncementActiveDraft((v) => !v)}
-                    className={`flex h-6 w-11 items-center rounded-full p-0.5 transition ${
-                      announcementActiveDraft ? 'bg-white justify-end' : 'bg-white/20 justify-start'
+                    onClick={() => setOwnerTab(tab.id)}
+                    className={`rounded-xl py-2 px-1 text-[11px] font-semibold transition ${
+                      ownerTab === tab.id
+                        ? 'bg-white text-black shadow-spatial-white'
+                        : 'text-white/60 hover:text-white'
                     }`}
-                    aria-label="Toggle Global Announcement Active"
                   >
-                    <span
-                      className={`h-5 w-5 rounded-full transition ${
-                        announcementActiveDraft ? 'bg-black' : 'bg-white/80'
-                      }`}
-                    />
+                    {tab.label}
                   </button>
-                </div>
-
-                <input
-                  type="text"
-                  value={announcementTextDraft}
-                  onChange={(e) => setAnnouncementTextDraft(e.target.value.slice(0, 180))}
-                  placeholder="Broadcast a live banner to all users..."
-                  className="w-full rounded-xl border border-white/16 bg-[#121212] px-3 py-2 text-xs text-white placeholder:text-white/30 focus:border-white focus:outline-none"
-                />
-
-                <div className="flex flex-wrap items-center justify-between gap-2">
-                  <span className="font-mono text-[10px] text-white/40">
-                    config/appState • {announcementActiveDraft ? 'Active' : 'Hidden'}
-                  </span>
-                  <div className="flex items-center gap-2">
-                    <button
-                      type="button"
-                      disabled={announcementSaving}
-                      onClick={handleClearAnnouncement}
-                      className="flex items-center gap-1 rounded-xl border border-white/25 bg-[#121212] px-3 py-1.5 text-xs font-medium text-white/85 hover:border-white hover:text-white transition active:scale-95 disabled:opacity-50"
-                    >
-                      <Trash2 className="h-3.5 w-3.5" />
-                      <span>Delete / Clear Active Announcement</span>
-                    </button>
-                    <button
-                      type="submit"
-                      disabled={announcementSaving}
-                      className="rounded-xl bg-white px-3.5 py-1.5 text-xs font-semibold text-black shadow-spatial-white transition active:scale-95 disabled:opacity-50"
-                    >
-                      {announcementSaving ? 'Saving...' : 'Publish Banner'}
-                    </button>
-                  </div>
-                </div>
-              </form>
-
-              {/* 2. Live Feature Toggles (config/appState) */}
-              <div className="mt-4 rounded-2xl border border-white/16 bg-black p-4 space-y-2.5">
-                <div className="text-[10px] font-semibold uppercase tracking-[0.18em] text-white/45">
-                  Live Feature Toggles (config/appState)
-                </div>
-
-                <button
-                  type="button"
-                  onClick={() => handleToggleAppFeature('allowNewSignups', !appState.allowNewSignups)}
-                  className="flex w-full items-center justify-between rounded-xl border border-white/14 bg-[#121212] px-3.5 py-2.5 text-left"
-                >
-                  <div className="flex items-center gap-2.5 pr-3">
-                    <UserPlus className="h-4 w-4 text-white/80 shrink-0" />
-                    <div>
-                      <div className="text-xs font-semibold text-white">New Sign-ups</div>
-                      <div className="text-[10.5px] text-white/45">
-                        Allow new users to claim @username handles
-                      </div>
-                    </div>
-                  </div>
-                  <div
-                    className={`flex h-6 w-11 shrink-0 items-center rounded-full p-0.5 transition ${
-                      appState.allowNewSignups ? 'bg-white justify-end' : 'bg-white/20 justify-start'
-                    }`}
-                  >
-                    <span
-                      className={`h-5 w-5 rounded-full ${
-                        appState.allowNewSignups ? 'bg-black' : 'bg-white/80'
-                      }`}
-                    />
-                  </div>
-                </button>
-
-                <button
-                  type="button"
-                  onClick={() => handleToggleAppFeature('allowVideoCalls', !appState.allowVideoCalls)}
-                  className="flex w-full items-center justify-between rounded-xl border border-white/14 bg-[#121212] px-3.5 py-2.5 text-left"
-                >
-                  <div className="flex items-center gap-2.5 pr-3">
-                    <Video className="h-4 w-4 text-white/80 shrink-0" />
-                    <div>
-                      <div className="text-xs font-semibold text-white">45s Video Calls</div>
-                      <div className="text-[10.5px] text-white/45">
-                        Enable Jitsi 45-second expiring call invites
-                      </div>
-                    </div>
-                  </div>
-                  <div
-                    className={`flex h-6 w-11 shrink-0 items-center rounded-full p-0.5 transition ${
-                      appState.allowVideoCalls ? 'bg-white justify-end' : 'bg-white/20 justify-start'
-                    }`}
-                  >
-                    <span
-                      className={`h-5 w-5 rounded-full ${
-                        appState.allowVideoCalls ? 'bg-black' : 'bg-white/80'
-                      }`}
-                    />
-                  </div>
-                </button>
+                ))}
               </div>
 
-              {/* 3. Spark-Friendly User Directory */}
-              <div className="mt-4 rounded-2xl border border-white/16 bg-black p-4">
-                <div className="flex items-center justify-between gap-2">
-                  <div className="text-[10px] font-semibold uppercase tracking-[0.18em] text-white/45">
-                    User Directory ({filteredDirectory.length})
-                  </div>
-                  <span className="font-mono text-[9.5px] text-white/35">
-                    On-demand • 25/page
-                  </span>
-                </div>
-
-                <div className="mt-2.5 flex items-center rounded-xl border border-white/14 bg-[#121212] px-3 py-2">
-                  <Search className="mr-2 h-3.5 w-3.5 text-white/40" />
-                  <input
-                    type="text"
-                    value={ownerSearch}
-                    onChange={(e) => setOwnerSearch(e.target.value)}
-                    placeholder="Filter loaded users by @username, name, or UID..."
-                    className="w-full bg-transparent text-xs text-white placeholder:text-white/30 focus:outline-none"
-                  />
-                </div>
-
-                <div className="mt-3 space-y-2.5">
-                  {filteredDirectory.length === 0 ? (
-                    <div className="rounded-xl border border-white/10 bg-[#121212] py-4 text-center text-xs text-white/45">
-                      {ownerLoading ? 'Loading directory...' : 'No users matched.'}
+              {ownerTab === 'users' && (
+                <>
+                  {/* 1. Global Announcement Banner Editor (config/appState) */}
+                  <form
+                    onSubmit={handleSaveAnnouncement}
+                    className="mt-4 rounded-2xl border border-white/16 bg-black p-4 space-y-3"
+                  >
+                    <div className="flex items-center justify-between">
+                      <div className="flex items-center gap-2">
+                        <Megaphone className="h-4 w-4 text-white" />
+                        <span className="text-xs font-semibold uppercase tracking-[0.15em] text-white">
+                          Global Announcement
+                        </span>
+                      </div>
+                      <button
+                        type="button"
+                        onClick={() => setAnnouncementActiveDraft((v) => !v)}
+                        className={`flex h-6 w-11 items-center rounded-full p-0.5 transition ${
+                          announcementActiveDraft ? 'bg-white justify-end' : 'bg-white/20 justify-start'
+                        }`}
+                        aria-label="Toggle Global Announcement Active"
+                      >
+                        <span
+                          className={`h-5 w-5 rounded-full transition ${
+                            announcementActiveDraft ? 'bg-black' : 'bg-white/80'
+                          }`}
+                        />
+                      </button>
                     </div>
-                  ) : (
-                    filteredDirectory.map((u) => {
-                      const targetUid = String(u.uid || u.id || '');
-                      const isSelf = targetUid === myProfile?.uid;
-                      const isBusy = ownerActionUid === targetUid;
-                      const draftVal = badgeDrafts[targetUid] ?? u.badge ?? '';
-                      const isTargetAdmin = hasAdminAccess(u, OWNER_UID);
-                      const currentRole =
-                        u.role === 'owner' || u.role === 'superadmin' || u.role === 'admin'
-                          ? u.role
-                          : isTargetAdmin
-                          ? 'admin'
-                          : 'user';
-                      const roleLabel = currentRole.toUpperCase();
-                      const isConfirmingDelete = confirmDeleteUid === targetUid;
 
-                      return (
-                        <div
-                          key={targetUid}
-                          className="rounded-xl border border-white/14 bg-[#121212] p-3 space-y-2.5"
+                    <input
+                      type="text"
+                      value={announcementTextDraft}
+                      onChange={(e) => setAnnouncementTextDraft(e.target.value.slice(0, 180))}
+                      placeholder="Broadcast a live banner to all users..."
+                      className="w-full rounded-xl border border-white/16 bg-[#121212] px-3 py-2 text-xs text-white placeholder:text-white/30 focus:border-white focus:outline-none"
+                    />
+
+                    <div className="flex flex-wrap items-center justify-between gap-2">
+                      <span className="font-mono text-[10px] text-white/40">
+                        config/appState • {announcementActiveDraft ? 'Active' : 'Hidden'}
+                      </span>
+                      <div className="flex items-center gap-2">
+                        <button
+                          type="button"
+                          disabled={announcementSaving}
+                          onClick={handleClearAnnouncement}
+                          className="flex items-center gap-1 rounded-xl border border-white/25 bg-[#121212] px-3 py-1.5 text-xs font-medium text-white/85 hover:border-white hover:text-white transition active:scale-95 disabled:opacity-50"
                         >
-                          <div className="flex items-start justify-between gap-2">
-                            <div className="min-w-0">
-                              <div className="flex items-center gap-1.5 flex-wrap">
-                                <span className="text-xs font-semibold text-white">
-                                  {u.nickname || u.displayName || (u.usernameLower ? `@${u.usernameLower}` : u.email || 'User')}
-                                </span>
-                                {u.usernameLower && (
-                                  <span className="font-mono text-[11px] text-white/55">
-                                    @{u.usernameLower}
-                                  </span>
-                                )}
-                                <span className="rounded-full border border-white/25 bg-black px-2 py-0.5 font-mono text-[9px] font-semibold uppercase tracking-wider text-white/80">
-                                  {roleLabel}
-                                </span>
-                                {u.badge && (
-                                  <span className="rounded-full border border-white/30 bg-white/10 px-2 py-0.5 font-mono text-[9px] font-semibold uppercase tracking-wider text-white">
-                                    {u.badge}
-                                  </span>
-                                )}
-                                {u.isBanned && (
-                                  <span className="rounded-full border border-white/40 bg-white px-2 py-0.5 font-mono text-[9px] font-bold uppercase tracking-wider text-black">
-                                    BANNED
-                                  </span>
-                                )}
-                              </div>
-                              {u.email && (
-                                <div className="mt-0.5 truncate font-mono text-[10px] text-white/50">
-                                  {u.email}
+                          <Trash2 className="h-3.5 w-3.5" />
+                          <span>Delete / Clear Active Announcement</span>
+                        </button>
+                        <button
+                          type="submit"
+                          disabled={announcementSaving}
+                          className="rounded-xl bg-white px-3.5 py-1.5 text-xs font-semibold text-black shadow-spatial-white transition active:scale-95 disabled:opacity-50"
+                        >
+                          {announcementSaving ? 'Saving...' : 'Publish Banner'}
+                        </button>
+                      </div>
+                    </div>
+                  </form>
+
+                  {/* 2. Live Feature Toggles (config/appState) */}
+                  <div className="mt-4 rounded-2xl border border-white/16 bg-black p-4 space-y-2.5">
+                    <div className="text-[10px] font-semibold uppercase tracking-[0.18em] text-white/45">
+                      Live Feature Toggles (config/appState)
+                    </div>
+
+                    <button
+                      type="button"
+                      onClick={() => handleToggleAppFeature('allowNewSignups', !appState.allowNewSignups)}
+                      className="flex w-full items-center justify-between rounded-xl border border-white/14 bg-[#121212] px-3.5 py-2.5 text-left"
+                    >
+                      <div className="flex items-center gap-2.5 pr-3">
+                        <UserPlus className="h-4 w-4 text-white/80 shrink-0" />
+                        <div>
+                          <div className="text-xs font-semibold text-white">New Sign-ups</div>
+                          <div className="text-[10.5px] text-white/45">
+                            Allow new users to claim @username handles
+                          </div>
+                        </div>
+                      </div>
+                      <div
+                        className={`flex h-6 w-11 shrink-0 items-center rounded-full p-0.5 transition ${
+                          appState.allowNewSignups ? 'bg-white justify-end' : 'bg-white/20 justify-start'
+                        }`}
+                      >
+                        <span
+                          className={`h-5 w-5 rounded-full ${
+                            appState.allowNewSignups ? 'bg-black' : 'bg-white/80'
+                          }`}
+                        />
+                      </div>
+                    </button>
+
+                    <button
+                      type="button"
+                      onClick={() => handleToggleAppFeature('allowVideoCalls', !appState.allowVideoCalls)}
+                      className="flex w-full items-center justify-between rounded-xl border border-white/14 bg-[#121212] px-3.5 py-2.5 text-left"
+                    >
+                      <div className="flex items-center gap-2.5 pr-3">
+                        <Video className="h-4 w-4 text-white/80 shrink-0" />
+                        <div>
+                          <div className="text-xs font-semibold text-white">45s Video Calls</div>
+                          <div className="text-[10.5px] text-white/45">
+                            Enable Jitsi 45-second expiring call invites
+                          </div>
+                        </div>
+                      </div>
+                      <div
+                        className={`flex h-6 w-11 shrink-0 items-center rounded-full p-0.5 transition ${
+                          appState.allowVideoCalls ? 'bg-white justify-end' : 'bg-white/20 justify-start'
+                        }`}
+                      >
+                        <span
+                          className={`h-5 w-5 rounded-full ${
+                            appState.allowVideoCalls ? 'bg-black' : 'bg-white/80'
+                          }`}
+                        />
+                      </div>
+                    </button>
+                  </div>
+
+                  {/* 3. Full User Directory */}
+                  <div className="mt-4 rounded-2xl border border-white/16 bg-black p-4">
+                    <div className="flex items-center justify-between gap-2">
+                      <div className="text-[10px] font-semibold uppercase tracking-[0.18em] text-white/45">
+                        User Directory ({filteredDirectory.length})
+                      </div>
+                      <span className="font-mono text-[9.5px] text-white/35">
+                        All Registered Users
+                      </span>
+                    </div>
+
+                    <div className="mt-2.5 flex items-center rounded-xl border border-white/14 bg-[#121212] px-3 py-2">
+                      <Search className="mr-2 h-3.5 w-3.5 text-white/40" />
+                      <input
+                        type="text"
+                        value={ownerSearch}
+                        onChange={(e) => setOwnerSearch(e.target.value)}
+                        placeholder="Filter users by @username, email, name, or UID..."
+                        className="w-full bg-transparent text-xs text-white placeholder:text-white/30 focus:outline-none"
+                      />
+                    </div>
+
+                    <div className="mt-3 space-y-2.5">
+                      {filteredDirectory.length === 0 ? (
+                        <div className="rounded-xl border border-white/10 bg-[#121212] py-4 text-center text-xs text-white/45">
+                          {ownerLoading ? 'Loading directory...' : 'No users matched.'}
+                        </div>
+                      ) : (
+                        filteredDirectory.map((u) => {
+                          const targetUid = String(u.uid || u.id || '');
+                          const isSelf = targetUid === myProfile?.uid;
+                          const isBusy = ownerActionUid === targetUid;
+                          const draftVal = badgeDrafts[targetUid] ?? u.badge ?? '';
+                          const isTargetAdmin = hasAdminAccess(u, OWNER_UID);
+                          const currentRole =
+                            u.role === 'owner' || u.role === 'superadmin' || u.role === 'admin'
+                              ? u.role
+                              : isTargetAdmin
+                              ? 'admin'
+                              : 'user';
+                          const roleLabel = currentRole.toUpperCase();
+                          const isConfirmingDelete = confirmDeleteUid === targetUid;
+
+                          return (
+                            <div
+                              key={targetUid}
+                              className="rounded-xl border border-white/14 bg-[#121212] p-3 space-y-2.5"
+                            >
+                              <div className="flex items-start justify-between gap-2">
+                                <div className="min-w-0">
+                                  <div className="flex items-center gap-1.5 flex-wrap">
+                                    <span className="text-xs font-semibold text-white">
+                                      {u.nickname || u.displayName || (u.usernameLower ? `@${u.usernameLower}` : u.email || 'User')}
+                                    </span>
+                                    {(u.usernameLower || u.username) && (
+                                      <span className="font-mono text-[11px] text-white/55">
+                                        @{String(u.usernameLower || u.username).replace(/^@+/, '')}
+                                      </span>
+                                    )}
+                                    <span className="rounded-full border border-white/25 bg-black px-2 py-0.5 font-mono text-[9px] font-semibold uppercase tracking-wider text-white/80">
+                                      {roleLabel}
+                                    </span>
+                                    {u.badge && (
+                                      <span className="rounded-full border border-white/30 bg-white/10 px-2 py-0.5 font-mono text-[9px] font-semibold uppercase tracking-wider text-white">
+                                        {u.badge}
+                                      </span>
+                                    )}
+                                    {u.isBanned && (
+                                      <span className="rounded-full border border-white/40 bg-white px-2 py-0.5 font-mono text-[9px] font-bold uppercase tracking-wider text-black">
+                                        BANNED
+                                      </span>
+                                    )}
+                                  </div>
+                                  {u.email && (
+                                    <div className="mt-0.5 truncate font-mono text-[10px] text-white/50">
+                                      {u.email}
+                                    </div>
+                                  )}
+                                  <div className="mt-0.5 truncate font-mono text-[10px] text-white/35">
+                                    UID: {targetUid}
+                                  </div>
                                 </div>
-                              )}
-                              <div className="mt-0.5 truncate font-mono text-[10px] text-white/35">
-                                UID: {targetUid}
+
+                                <div className="flex shrink-0 flex-wrap items-center justify-end gap-1.5">
+                                  <select
+                                    aria-label={`Change role for ${u.usernameLower || targetUid}`}
+                                    disabled={isBusy}
+                                    value={currentRole}
+                                    onChange={(e) => handleUpdateUserRole(u, e.target.value)}
+                                    className="rounded-lg border border-white/25 bg-black px-2 py-1.5 font-mono text-[10.5px] font-semibold text-white focus:border-white focus:outline-none disabled:opacity-40"
+                                  >
+                                    <option value="user" disabled={isSelf && isTargetAdmin}>
+                                      user
+                                    </option>
+                                    <option value="admin">admin</option>
+                                    <option value="superadmin">superadmin</option>
+                                    <option value="owner">owner</option>
+                                  </select>
+
+                                  <button
+                                    type="button"
+                                    disabled={isSelf || isBusy}
+                                    onClick={() => handleToggleBan(u)}
+                                    className={`flex items-center gap-1 rounded-lg border px-2.5 py-1.5 text-[10.5px] font-semibold transition disabled:opacity-35 ${
+                                      u.isBanned
+                                        ? 'border-white bg-white text-black'
+                                        : 'border-white/25 bg-black text-white hover:bg-white hover:text-black'
+                                    }`}
+                                    title={isSelf ? 'Cannot ban yourself' : u.isBanned ? 'Unban user' : 'Ban user'}
+                                  >
+                                    <Ban className="h-3 w-3" />
+                                    <span>{u.isBanned ? 'Unban' : 'Ban'}</span>
+                                  </button>
+
+                                  {!isSelf && (
+                                    <button
+                                      type="button"
+                                      disabled={isBusy}
+                                      onClick={() => {
+                                        if (isConfirmingDelete) {
+                                          handleDeleteUser(u);
+                                        } else {
+                                          setConfirmDeleteUid(targetUid);
+                                        }
+                                      }}
+                                      className={`flex items-center gap-1 rounded-lg border px-2.5 py-1.5 text-[10.5px] font-semibold transition disabled:opacity-35 ${
+                                        isConfirmingDelete
+                                          ? 'border-white bg-white text-black'
+                                          : 'border-white/25 bg-black text-white/80 hover:border-white hover:text-white'
+                                      }`}
+                                      title="Delete user document"
+                                    >
+                                      <Trash2 className="h-3 w-3" />
+                                      <span>{isConfirmingDelete ? 'Confirm' : 'Delete'}</span>
+                                    </button>
+                                  )}
+                                </div>
                               </div>
-                            </div>
 
-                            <div className="flex shrink-0 flex-wrap items-center justify-end gap-1.5">
-                              <select
-                                aria-label={`Change role for ${u.usernameLower || targetUid}`}
-                                disabled={isBusy}
-                                value={currentRole}
-                                onChange={(e) => handleUpdateUserRole(u, e.target.value)}
-                                className="rounded-lg border border-white/25 bg-black px-2 py-1.5 font-mono text-[10.5px] font-semibold text-white focus:border-white focus:outline-none disabled:opacity-40"
-                              >
-                                <option value="user" disabled={isSelf && isTargetAdmin}>
-                                  user
-                                </option>
-                                <option value="admin">admin</option>
-                                <option value="superadmin">superadmin</option>
-                                <option value="owner">owner</option>
-                              </select>
-
-                              <button
-                                type="button"
-                                disabled={isSelf || isBusy}
-                                onClick={() => handleToggleBan(u)}
-                                className={`flex items-center gap-1 rounded-lg border px-2.5 py-1.5 text-[10.5px] font-semibold transition disabled:opacity-35 ${
-                                  u.isBanned
-                                    ? 'border-white bg-white text-black'
-                                    : 'border-white/25 bg-black text-white hover:bg-white hover:text-black'
-                                }`}
-                                title={isSelf ? 'Cannot ban yourself' : u.isBanned ? 'Unban user' : 'Ban user'}
-                              >
-                                <Ban className="h-3 w-3" />
-                                <span>{u.isBanned ? 'Unban' : 'Ban'}</span>
-                              </button>
-
-                              {!isSelf && (
+                              {/* Custom Badge Editor */}
+                              <div className="flex items-center gap-1.5">
+                                <div className="flex flex-1 items-center rounded-lg border border-white/14 bg-black px-2.5 py-1.5">
+                                  <Tag className="mr-1.5 h-3 w-3 text-white/40 shrink-0" />
+                                  <input
+                                    type="text"
+                                    value={draftVal}
+                                    onChange={(e) =>
+                                      setBadgeDrafts((prev) => ({
+                                        ...prev,
+                                        [targetUid]: e.target.value.slice(0, 16),
+                                      }))
+                                    }
+                                    placeholder="Badge (e.g. OWNER, FAMILY)"
+                                    className="w-full bg-transparent font-mono text-[11px] text-white placeholder:text-white/25 focus:outline-none"
+                                  />
+                                </div>
                                 <button
                                   type="button"
                                   disabled={isBusy}
-                                  onClick={() => {
-                                    if (isConfirmingDelete) {
-                                      handleDeleteUser(u);
-                                    } else {
-                                      setConfirmDeleteUid(targetUid);
-                                    }
-                                  }}
-                                  className={`flex items-center gap-1 rounded-lg border px-2.5 py-1.5 text-[10.5px] font-semibold transition disabled:opacity-35 ${
-                                    isConfirmingDelete
-                                      ? 'border-white bg-white text-black'
-                                      : 'border-white/25 bg-black text-white/80 hover:border-white hover:text-white'
-                                  }`}
-                                  title="Delete user document"
+                                  onClick={() => handleAssignBadge(targetUid, draftVal)}
+                                  className="flex items-center gap-1 rounded-lg bg-white px-2.5 py-1.5 text-[10.5px] font-semibold text-black transition active:scale-95 disabled:opacity-40"
                                 >
-                                  <Trash2 className="h-3 w-3" />
-                                  <span>{isConfirmingDelete ? 'Confirm' : 'Delete'}</span>
+                                  <Check className="h-3 w-3" />
+                                  <span>Set</span>
+                                </button>
+                              </div>
+
+                              <div className="flex items-center gap-1.5 flex-wrap">
+                                {['OWNER', 'FAMILY', 'VIP', ''].map((preset) => (
+                                  <button
+                                    key={preset || 'clear'}
+                                    type="button"
+                                    disabled={isBusy}
+                                    onClick={() => {
+                                      setBadgeDrafts((prev) => ({ ...prev, [targetUid]: preset }));
+                                      handleAssignBadge(targetUid, preset);
+                                    }}
+                                    className="rounded-md border border-white/14 bg-black px-2 py-0.5 font-mono text-[9.5px] text-white/65 hover:border-white/40 hover:text-white transition"
+                                  >
+                                    {preset || 'Clear'}
+                                  </button>
+                                ))}
+                              </div>
+                            </div>
+                          );
+                        })
+                      )}
+                    </div>
+
+                    {ownerHasMore && (
+                      <button
+                        type="button"
+                        disabled={ownerLoading}
+                        onClick={loadMoreDirectoryUsers}
+                        className="mt-3 w-full rounded-xl border border-white/18 bg-[#121212] py-2 text-xs font-medium text-white hover:border-white/40 transition disabled:opacity-45"
+                      >
+                        {ownerLoading ? 'Loading...' : 'Load Next 25 Users'}
+                      </button>
+                    )}
+                  </div>
+                </>
+              )}
+
+              {/* Dedicated Real-Time Reports Tab */}
+              {ownerTab === 'reports' && (
+                <div className="mt-4 rounded-2xl border border-white/16 bg-black p-4 space-y-3">
+                  <div className="flex items-center justify-between gap-2">
+                    <div className="flex items-center gap-2">
+                      <AlertTriangle className="h-4 w-4 text-red-400" />
+                      <span className="text-[10px] font-semibold uppercase tracking-[0.18em] text-white/75">
+                        User Reports ({ownerReports.length}) • Live
+                      </span>
+                    </div>
+                  </div>
+
+                  {ownerReports.length === 0 ? (
+                    <div className="rounded-xl border border-white/10 bg-[#121212] py-6 text-center text-xs text-white/45">
+                      No user reports submitted yet.
+                    </div>
+                  ) : (
+                    <div className="space-y-2.5">
+                      {ownerReports.map((rep) => {
+                        const reporterLabel =
+                          rep.reporterName ||
+                          (rep.reporterUsername ? `@${rep.reporterUsername}` : rep.reporterId || rep.reporterUid || 'Unknown');
+                        const reportedLabel =
+                          rep.reportedUserName ||
+                          (rep.reportedUsername ? `@${rep.reportedUsername}` : rep.reportedUserId || rep.reportedUid || 'Unknown');
+                        const reportedUid = String(rep.reportedUserId || rep.reportedUid || '');
+                        const tsMs = getMillis(rep.createdAt, rep.createdAtMs);
+                        const isResolved = rep.status === 'resolved';
+
+                        return (
+                          <div
+                            key={rep.id}
+                            className="rounded-xl border border-white/14 bg-[#121212] p-3 text-xs space-y-2"
+                          >
+                            <div className="flex items-start justify-between gap-2">
+                              <div className="min-w-0">
+                                <div className="font-semibold text-white">
+                                  {rep.reason || 'Report'}
+                                </div>
+                                <div className="mt-0.5 text-[11px] text-white/70">
+                                  <span className="text-white/45">From:</span>{' '}
+                                  <span className="font-medium text-white">{reporterLabel}</span>
+                                  {rep.reporterUsername && (
+                                    <span className="ml-1 font-mono text-[10px] text-white/50">
+                                      @{rep.reporterUsername}
+                                    </span>
+                                  )}
+                                </div>
+                                <div className="text-[11px] text-white/70">
+                                  <span className="text-white/45">Reported:</span>{' '}
+                                  <span className="font-medium text-red-300">{reportedLabel}</span>
+                                  {rep.reportedUsername && (
+                                    <span className="ml-1 font-mono text-[10px] text-white/50">
+                                      @{rep.reportedUsername}
+                                    </span>
+                                  )}
+                                </div>
+                              </div>
+
+                              <span
+                                className={`shrink-0 rounded-full border px-2 py-0.5 font-mono text-[9px] uppercase ${
+                                  isResolved
+                                    ? 'border-white/25 bg-white text-black font-bold'
+                                    : 'border-red-400/40 bg-red-500/15 text-red-200'
+                                }`}
+                              >
+                                {rep.status || 'open'}
+                              </span>
+                            </div>
+
+                            {rep.details && (
+                              <p className="rounded-lg border border-white/10 bg-black/60 px-2.5 py-2 text-[11px] text-white/75 break-words">
+                                {rep.details}
+                              </p>
+                            )}
+
+                            <div className="font-mono text-[9.5px] text-white/40">
+                              {tsMs ? new Date(tsMs).toLocaleString() : 'Just now'}
+                              {reportedUid ? ` • Target UID: ${reportedUid}` : ''}
+                            </div>
+
+                            <div className="flex flex-wrap items-center gap-1.5 pt-1">
+                              {!isResolved && (
+                                <button
+                                  type="button"
+                                  onClick={() => handleResolveReport(rep.id, 'resolved')}
+                                  className="flex items-center gap-1 rounded-lg bg-white px-2.5 py-1.5 text-[10.5px] font-semibold text-black transition active:scale-95"
+                                >
+                                  <Check className="h-3 w-3" />
+                                  <span>Mark Resolved</span>
                                 </button>
                               )}
-                            </div>
-                          </div>
 
-                          {/* Custom Badge Editor */}
-                          <div className="flex items-center gap-1.5">
-                            <div className="flex flex-1 items-center rounded-lg border border-white/14 bg-black px-2.5 py-1.5">
-                              <Tag className="mr-1.5 h-3 w-3 text-white/40 shrink-0" />
-                              <input
-                                type="text"
-                                value={draftVal}
-                                onChange={(e) =>
-                                  setBadgeDrafts((prev) => ({
-                                    ...prev,
-                                    [targetUid]: e.target.value.slice(0, 16),
-                                  }))
-                                }
-                                placeholder="Badge (e.g. OWNER, FAMILY)"
-                                className="w-full bg-transparent font-mono text-[11px] text-white placeholder:text-white/25 focus:outline-none"
-                              />
-                            </div>
-                            <button
-                              type="button"
-                              disabled={isBusy}
-                              onClick={() => handleAssignBadge(targetUid, draftVal)}
-                              className="flex items-center gap-1 rounded-lg bg-white px-2.5 py-1.5 text-[10.5px] font-semibold text-black transition active:scale-95 disabled:opacity-40"
-                            >
-                              <Check className="h-3 w-3" />
-                              <span>Set</span>
-                            </button>
-                          </div>
+                              {reportedUid && reportedUid !== myProfile?.uid && (
+                                <button
+                                  type="button"
+                                  disabled={ownerActionUid === reportedUid}
+                                  onClick={() => handleBanReportedUser(rep)}
+                                  className="flex items-center gap-1 rounded-lg border border-red-500/50 bg-red-600 px-2.5 py-1.5 text-[10.5px] font-semibold text-white hover:bg-red-500 transition disabled:opacity-45"
+                                >
+                                  <Ban className="h-3 w-3" />
+                                  <span>Ban Reported User</span>
+                                </button>
+                              )}
 
-                          <div className="flex items-center gap-1.5 flex-wrap">
-                            {['OWNER', 'FAMILY', 'VIP', ''].map((preset) => (
                               <button
-                                key={preset || 'clear'}
                                 type="button"
-                                disabled={isBusy}
-                                onClick={() => {
-                                  setBadgeDrafts((prev) => ({ ...prev, [targetUid]: preset }));
-                                  handleAssignBadge(targetUid, preset);
-                                }}
-                                className="rounded-md border border-white/14 bg-black px-2 py-0.5 font-mono text-[9.5px] text-white/65 hover:border-white/40 hover:text-white transition"
+                                onClick={() => handleDeleteReport(rep.id)}
+                                className="flex items-center gap-1 rounded-lg border border-white/20 bg-black px-2.5 py-1.5 text-[10.5px] font-medium text-white/80 hover:border-white hover:text-white transition"
                               >
-                                {preset || 'Clear'}
+                                <Trash2 className="h-3 w-3" />
+                                <span>Delete Report</span>
                               </button>
-                            ))}
+                            </div>
                           </div>
-                        </div>
-                      );
-                    })
+                        );
+                      })}
+                    </div>
                   )}
                 </div>
+              )}
 
-                {ownerHasMore && (
-                  <button
-                    type="button"
-                    disabled={ownerLoading}
-                    onClick={loadMoreDirectoryUsers}
-                    className="mt-3 w-full rounded-xl border border-white/18 bg-[#121212] py-2 text-xs font-medium text-white hover:border-white/40 transition disabled:opacity-45"
-                  >
-                    {ownerLoading ? 'Loading...' : 'Load Next 25 Users'}
-                  </button>
-                )}
-              </div>
-
-              {/* 4. Reports & Audit Logs */}
-              <div className="mt-4 rounded-2xl border border-white/16 bg-black p-4 space-y-3">
-                <div className="flex items-center justify-between gap-2">
-                  <div className="flex items-center gap-2">
-                    <FileText className="h-4 w-4 text-white" />
-                    <span className="text-[10px] font-semibold uppercase tracking-[0.18em] text-white/60">
-                      Reports ({ownerReports.length}) &amp; Audit Logs ({ownerLogs.length})
-                    </span>
-                  </div>
-                </div>
-
-                {ownerReports.length > 0 && (
-                  <div className="space-y-2">
-                    <div className="font-mono text-[10px] uppercase tracking-wider text-white/45">
-                      User Reports
-                    </div>
-                    {ownerReports.map((rep) => (
-                      <div
-                        key={rep.id}
-                        className="rounded-xl border border-white/14 bg-[#121212] p-2.5 text-xs space-y-1.5"
-                      >
-                        <div className="flex items-center justify-between gap-2">
-                          <span className="font-semibold text-white truncate">
-                            {rep.reason || 'Report'}
-                          </span>
-                          <span className="rounded-full border border-white/25 bg-black px-2 py-0.5 font-mono text-[9px] uppercase text-white/80">
-                            {rep.status || 'open'}
-                          </span>
-                        </div>
-                        {rep.details && (
-                          <p className="text-[11px] text-white/65 break-words">{rep.details}</p>
-                        )}
-                        <div className="flex items-center justify-between gap-2 pt-1">
-                          <span className="font-mono text-[9.5px] text-white/40 truncate">
-                            By: {rep.reporterUid || 'unknown'}
-                          </span>
-                          {rep.status !== 'resolved' && rep.status !== 'dismissed' && (
-                            <div className="flex items-center gap-1.5">
-                              <button
-                                type="button"
-                                onClick={() => handleResolveReport(rep.id, 'resolved')}
-                                className="rounded-md bg-white px-2 py-1 text-[10px] font-semibold text-black"
-                              >
-                                Resolve
-                              </button>
-                              <button
-                                type="button"
-                                onClick={() => handleResolveReport(rep.id, 'dismissed')}
-                                className="rounded-md border border-white/20 bg-black px-2 py-1 text-[10px] text-white/75"
-                              >
-                                Dismiss
-                              </button>
-                            </div>
-                          )}
-                        </div>
-                      </div>
-                    ))}
-                  </div>
-                )}
-
-                <div className="space-y-1.5">
+              {/* Audit Logs Tab */}
+              {ownerTab === 'logs' && (
+                <div className="mt-4 rounded-2xl border border-white/16 bg-black p-4 space-y-2.5">
                   <div className="flex items-center justify-between gap-2">
-                    <div className="font-mono text-[10px] uppercase tracking-wider text-white/45">
-                      Recent Admin Audit Logs
+                    <div className="flex items-center gap-2">
+                      <FileText className="h-4 w-4 text-white" />
+                      <span className="text-[10px] font-semibold uppercase tracking-[0.18em] text-white/60">
+                        Recent Admin Audit Logs ({ownerLogs.length})
+                      </span>
                     </div>
                     {ownerLogs.length > 0 && (
                       <button
@@ -3510,11 +3766,11 @@ export default function App() {
                     )}
                   </div>
                   {ownerLogs.length === 0 ? (
-                    <div className="rounded-xl border border-white/10 bg-[#121212] py-3 text-center text-[11px] text-white/40">
+                    <div className="rounded-xl border border-white/10 bg-[#121212] py-4 text-center text-[11px] text-white/40">
                       No audit logs recorded yet.
                     </div>
                   ) : (
-                    ownerLogs.slice(0, 12).map((log) => (
+                    ownerLogs.slice(0, 25).map((log) => (
                       <div
                         key={log.id}
                         className="rounded-xl border border-white/12 bg-[#121212] px-3 py-2 font-mono text-[10.5px] text-white/75"
@@ -3535,7 +3791,45 @@ export default function App() {
                     ))
                   )}
                 </div>
+              )}
+            </div>
+          </div>
+        )}
+
+        {/* Custom Dark-Themed Popup Modal (replaces window.alert) */}
+        {modalPopup && (
+          <div
+            className="fixed inset-0 z-[80] flex items-center justify-center bg-black/80 px-5 backdrop-blur-md"
+            onClick={() => setModalPopup(null)}
+          >
+            <div
+              onClick={(e) => e.stopPropagation()}
+              role="dialog"
+              aria-modal="true"
+              className="animate-card-3d-in w-full max-w-[380px] rounded-3xl border border-white/25 bg-[#0D0D0D] p-5 shadow-spatial-card"
+            >
+              <div className="flex items-center gap-2.5">
+                {modalPopup.tone === 'error' ? (
+                  <AlertTriangle className="h-5 w-5 shrink-0 text-red-400" />
+                ) : modalPopup.tone === 'success' ? (
+                  <Check className="h-5 w-5 shrink-0 text-white" />
+                ) : (
+                  <Bell className="h-5 w-5 shrink-0 text-white" />
+                )}
+                <h3 className="text-base font-semibold text-white">{modalPopup.title}</h3>
               </div>
+
+              <p className="mt-3 text-xs leading-relaxed text-white/80 break-words">
+                {modalPopup.message}
+              </p>
+
+              <button
+                type="button"
+                onClick={() => setModalPopup(null)}
+                className="mt-5 w-full rounded-2xl bg-white py-2.5 text-xs font-semibold text-black shadow-spatial-white transition active:scale-[0.98]"
+              >
+                OK
+              </button>
             </div>
           </div>
         )}

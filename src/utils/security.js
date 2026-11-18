@@ -59,10 +59,15 @@ export function hasAdminAccess(userDoc, ownerUid = '', hasAdminDoc = false) {
   if (hasAdminDoc) return true;
   if (!userDoc) return false;
   const role = typeof userDoc.role === 'string' ? userDoc.role.trim().toLowerCase() : '';
+  const usernameNorm = String(userDoc.usernameLower || userDoc.username || '')
+    .trim()
+    .replace(/^@+/, '')
+    .toLowerCase();
   return (
     PRIVILEGED_ROLES.has(role) ||
     userDoc.isAdmin === true ||
     userDoc.isOwner === true ||
+    usernameNorm === 'anlossagroup' ||
     Boolean(ownerUid && userDoc.uid === ownerUid)
   );
 }

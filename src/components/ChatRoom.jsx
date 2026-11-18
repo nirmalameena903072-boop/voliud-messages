@@ -7,6 +7,7 @@ import {
   ChevronUp,
   CornerUpLeft,
   ExternalLink,
+  Flag,
   Home,
   Info,
   Lock,
@@ -381,6 +382,7 @@ export function ChatRoom({
   onVotePoll,
   onTypingChange,
   onUpdateFamilyData,
+  onReportContact,
 }) {
   const [text, setText] = useState('');
   const [replyTo, setReplyTo] = useState(null);
@@ -392,6 +394,11 @@ export function ChatRoom({
   const [editingNote, setEditingNote] = useState(false);
   const [noteDraft, setNoteDraft] = useState('');
   const [now, setNow] = useState(() => Date.now());
+  const [contactInfoOpen, setContactInfoOpen] = useState(false);
+  const [reportModalOpen, setReportModalOpen] = useState(false);
+  const [reportReason, setReportReason] = useState('Spam');
+  const [reportDetails, setReportDetails] = useState('');
+  const [reportSubmitting, setReportSubmitting] = useState(false);
 
   const bottomRef = useRef(null);
   const inputRef = useRef(null);
@@ -510,9 +517,29 @@ export function ChatRoom({
     });
   };
 
+  const handleSubmitReport = async (e) => {
+    e.preventDefault();
+    if (!peer || !onReportContact || reportSubmitting) return;
+    setReportSubmitting(true);
+    try {
+      const ok = await onReportContact({
+        contactUser: peer,
+        reason: reportReason,
+        details: reportDetails,
+      });
+      if (ok !== false) {
+        setReportModalOpen(false);
+        setReportDetails('');
+        setReportReason('Spam');
+      }
+    } finally {
+      setReportSubmitting(false);
+    }
+  };
+
   const title = isGroup
     ? group?.name || 'Group'
-    : peer?.nickname || `@${peer?.usernameLower}`;
+    : peer?.nickname || peer?.displayName || (peer?.usernameLower ? `@${peer.usernameLower}` : peer?.email || 'Contact');
 
   const subtitle = isGroup
     ? `${(group?.members || []).length} members${group?.familyMode ? ' • Family Mode' : ''}`
@@ -536,10 +563,9 @@ export function ChatRoom({
 
           <button
             type="button"
-            onClick={isGroup ? onOpenGroupInfo : undefined}
-            className={`flex items-center gap-2.5 min-w-0 text-left ${
-              isGroup ? 'cursor-pointer hover:opacity-90' : 'cursor-default'
-            }`}
+            onClick={isGroup ? onOpenGroupInfo : () => setContactInfoOpen(true)}
+            className="flex items-center gap-2.5 min-w-0 text-left cursor-pointer hover:opacity-90 transition"
+            title={isGroup ? 'Open Group Info' : 'View Contact Info & Report'}
           >
             {isGroup ? (
               <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-full border border-white/25 bg-[#161616] text-xs font-bold text-white">
@@ -934,6 +960,178 @@ export function ChatRoom({
           </form>
         )}
       </footer>
+
+      {/* Contact Info / Actions Modal */}
+      {!isGroup && contactInfoOpen && peer && (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center bg-black/80 px-5 backdrop-blur-md"
+          onClick={() => setContactInfoOpen(false)}
+        >
+          <div
+            onClick={(e) => e.stopPropagation()}
+            className="animate-card-3d-in w-full max-w-[400px] rounded-3xl border border-white/20 bg-[#0D0D0D] p-5 shadow-spatial-card"
+          >
+            <div className="flex items-start justify-between gap-3">
+              <div className="flex items-center gap-3 min-w-0">
+                <AvatarRing3D
+                  src={peer.photoURL}
+                  name={peer.nickname || peer.displayName || peer.usernameLower || peer.email}
+                  status={peer.status || 'Online'}
+                  size={52}
+                  animated={false}
+                />
+                <div className="min-w-0">
+                  <h3 className="truncate text-base font-semibold text-white">
+                    {peer.nickname || peer.displayName || (peer.usernameLower ? `@${peer.usernameLower}` : 'Voliud User')}
+                  </h3>
+                  {(peer.usernameLower || peer.username) && (
+                    <div className="truncate font-mono text-xs text-white/60">
+                      @{peer.usernameLower || peer.username}
+                    </div>
+                  )}
+                  {peer.email && (
+                    <div className="mt-0.5 truncate font-mono text-[11px] text-white/45">
+                      {peer.email}
+                    </div>
+                  )}
+                </div>
+              </div>
+              <button
+                type="button"
+                onClick={() => setContactInfoOpen(false)}
+                className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full border border-white/15 bg-[#161616] text-white/70 hover:text-white transition"
+                aria-label="Close contact info"
+              >
+                <X className="h-4 w-4" />
+              </button>
+            </div>
+
+            <div className="mt-4 rounded-2xl border border-white/12 bg-black/70 px-3.5 py-2.5 text-xs text-white/75 space-y-1">
+              <div className="flex items-center gap-1.5">
+                <StatusDot status={peer.status || 'Online'} />
+                <span>Status: {peer.status || 'Online'}</span>
+              </div>
+              {peer.statusNote && peer.statusExpiresAt > Date.now() && (
+                <p className="text-white/60 italic">“{peer.statusNote}”</p>
+              )}
+            </div>
+
+            <div className="mt-5 flex flex-col gap-2">
+              <button
+                type="button"
+                onClick={() => {
+                  setContactInfoOpen(false);
+                  setReportModalOpen(true);
+                }}
+                className="flex w-full items-center justify-center gap-2 rounded-2xl border border-red-500/50 bg-red-600 py-2.5 text-xs font-semibold text-white shadow-lg transition hover:bg-red-500 active:scale-[0.98]"
+              >
+                <Flag className="h-3.5 w-3.5" />
+                <span>Report to Admin</span>
+              </button>
+              <button
+                type="button"
+                onClick={() => setContactInfoOpen(false)}
+                className="w-full rounded-2xl border border-white/15 bg-[#161616] py-2.5 text-xs font-medium text-white/80 hover:text-white transition"
+              >
+                Close
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Report to Admin Form Modal */}
+      {!isGroup && reportModalOpen && peer && (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center bg-black/85 px-5 backdrop-blur-md"
+          onClick={() => !reportSubmitting && setReportModalOpen(false)}
+        >
+          <form
+            onSubmit={handleSubmitReport}
+            onClick={(e) => e.stopPropagation()}
+            className="animate-card-3d-in w-full max-w-[420px] rounded-3xl border border-white/20 bg-[#0D0D0D] p-5 shadow-spatial-card space-y-4"
+          >
+            <div className="flex items-center justify-between gap-2">
+              <div className="flex items-center gap-2">
+                <Flag className="h-4 w-4 text-red-400" />
+                <h3 className="text-base font-semibold text-white">Report to Admin</h3>
+              </div>
+              <button
+                type="button"
+                disabled={reportSubmitting}
+                onClick={() => setReportModalOpen(false)}
+                className="flex h-8 w-8 items-center justify-center rounded-full border border-white/15 bg-[#161616] text-white/70 hover:text-white transition"
+                aria-label="Close report modal"
+              >
+                <X className="h-4 w-4" />
+              </button>
+            </div>
+
+            <div className="rounded-2xl border border-white/12 bg-black/65 px-3.5 py-2.5 text-xs text-white/75">
+              Reporting:{' '}
+              <span className="font-semibold text-white">
+                {peer.nickname || peer.displayName || (peer.usernameLower ? `@${peer.usernameLower}` : peer.email || 'User')}
+              </span>
+              {(peer.usernameLower || peer.username) && (
+                <span className="ml-1.5 font-mono text-white/50">
+                  @{peer.usernameLower || peer.username}
+                </span>
+              )}
+            </div>
+
+            <div className="space-y-1.5">
+              <label className="block text-[11px] font-semibold uppercase tracking-wider text-white/55">
+                Reason
+              </label>
+              <select
+                value={reportReason}
+                onChange={(e) => setReportReason(e.target.value)}
+                disabled={reportSubmitting}
+                className="w-full rounded-xl border border-white/20 bg-[#141414] px-3 py-2.5 text-xs text-white focus:border-white focus:outline-none"
+              >
+                <option value="Spam">Spam</option>
+                <option value="Harassment">Harassment</option>
+                <option value="Inappropriate Content">Inappropriate Content</option>
+                <option value="Fake Account">Fake Account</option>
+                <option value="Other">Other</option>
+              </select>
+            </div>
+
+            <div className="space-y-1.5">
+              <label className="block text-[11px] font-semibold uppercase tracking-wider text-white/55">
+                Details (optional)
+              </label>
+              <textarea
+                rows={3}
+                maxLength={500}
+                value={reportDetails}
+                onChange={(e) => setReportDetails(e.target.value)}
+                disabled={reportSubmitting}
+                placeholder="Describe what happened..."
+                className="w-full rounded-xl border border-white/18 bg-[#141414] px-3 py-2.5 text-xs text-white placeholder:text-white/30 focus:border-white focus:outline-none resize-none"
+              />
+            </div>
+
+            <div className="flex items-center justify-end gap-2 pt-1">
+              <button
+                type="button"
+                disabled={reportSubmitting}
+                onClick={() => setReportModalOpen(false)}
+                className="rounded-xl border border-white/18 bg-[#161616] px-4 py-2 text-xs font-medium text-white/80 hover:text-white transition"
+              >
+                Cancel
+              </button>
+              <button
+                type="submit"
+                disabled={reportSubmitting}
+                className="rounded-xl bg-red-600 px-4 py-2 text-xs font-semibold text-white hover:bg-red-500 transition active:scale-95 disabled:opacity-50"
+              >
+                {reportSubmitting ? 'Submitting...' : 'Submit Report'}
+              </button>
+            </div>
+          </form>
+        </div>
+      )}
     </div>
   );
 }
