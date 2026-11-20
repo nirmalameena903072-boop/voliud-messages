@@ -1,6 +1,13 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
+  browserLocalPersistence,
+  browserSessionPersistence,
+  createUserWithEmailAndPassword,
+  deleteUser,
   onAuthStateChanged,
+  setPersistence,
+  signInAnonymously,
+  signInWithEmailAndPassword,
   signInWithPopup,
   signOut,
 } from 'firebase/auth';
@@ -32,9 +39,11 @@ import {
   Ban,
   Bell,
   Check,
+  Clock,
   FileText,
   Home,
   Lock,
+  LogOut,
   Megaphone,
   MessageSquare,
   Plus,
@@ -78,6 +87,26 @@ function getPairId(uidA, uidB) {
 
 function normalizeHandle(raw) {
   return (raw || '').trim().replace(/^@+/, '').toLowerCase().replace(/[^a-z0-9_]/g, '').slice(0, 12);
+}
+
+const GUEST_TTL_MS = 24 * 60 * 60 * 1000;
+
+function generateGuestHandle() {
+  const chars = 'abcdefghijklmnopqrstuvwxyz0123456789';
+  let suffix = '';
+  for (let i = 0; i < 5; i += 1) {
+    suffix += chars.charAt(Math.floor(Math.random() * chars.length));
+  }
+  return `guest_${suffix}`;
+}
+
+function formatGuestRemaining(expiresAtMs, nowMs) {
+  if (!expiresAtMs) return '24h 00m';
+  const remaining = Math.max(0, expiresAtMs - nowMs);
+  const totalMinutes = Math.floor(remaining / 60000);
+  const hours = Math.floor(totalMinutes / 60);
+  const minutes = totalMinutes % 60;
+  return `${hours}h ${String(minutes).padStart(2, '0')}m`;
 }
 
 function normalizeUserDoc(docId, data = {}) {
@@ -180,6 +209,7 @@ export default function App() {
     allowNewSignups: true,
     allowVideoCalls: true,
     adminOnlyMessaging: false,
+    guestLoginEnabled: true,
   });
   const [dismissedBannerId, setDismissedBannerId] = useState(() => {
     try {
@@ -188,6 +218,13 @@ export default function App() {
       return '';
     }
   });
+
+  // Guest 24h Demo session states
+  const [guestLoading, setGuestLoading] = useState(false);
+  const [guestEnding, setGuestEnding] = useState(false);
+  const [guestClockNow, setGuestClockNow] = useState(() => Date.now());
+  const guestProvisioningRef = useRef('');
+  const guestCleaningUpRef = useRef(false);
 
   // Chat Lock (PIN) & Confirmation Dialog state
   const [unlockedChatIds, setUnlockedChatIds] = useState({});
@@ -268,7 +305,7 @@ export default function App() {
   }, []);
 
   const syncUserProfileOnLogin = useCallback(async (user) => {
-    if (!isFirebaseConfigured || !db || !user?.uid) return null;
+    if (!isFirebaseConfigured || !db || !user?.uid || user.isAnonymous) return null;
     const userRef = doc(db, 'users', user.uid);
     const normalizedEmail = (user.email || '').trim().toLowerCase();
     const displayName = user.displayName || '';
@@ -309,6 +346,185 @@ export default function App() {
     }
   }, [showAppError]);
 
+  const provisionGuestIdentity = useCallback(
+    async (user) => {
+      if (!isFirebaseConfigured || !db || !user?.uid || !user.isAnonymous) return null;
+      if (guestProvisioningRef.current === user.uid) return null;
+      guestProvisioningRef.current = user.uid;
+
+      try {
+        const userRef = doc(db, 'users', user.uid);
+        const existingSnap = await getDoc(userRef);
+        if (existingSnap.exists() && existingSnap.data()?.usernameLower) {
+          const existingProfile = normalizeUserDoc(existingSnap.id, existingSnap.data());
+          setMyProfile(existingProfile);
+          return existingProfile;
+        }
+
+        const expiresAt = Date.now() + GUEST_TTL_MS;
+        let createdProfile = null;
+
+        for (let attempt = 0; attempt < 6; attempt += 1) {
+          const candidateHandle = generateGuestHandle();
+          try {
+            await runTransaction(db, async (tx) => {
+              const unameRef = doc(db, 'usernames', candidateHandle);
+              const unameSnap = await tx.get(unameRef);
+              if (unameSnap.exists()) {
+                const err = new Error('Guest handle collision');
+                err.code = 'guest-handle-collision';
+                throw err;
+              }
+              const uSnap = await tx.get(userRef);
+              if (uSnap.exists() && uSnap.data()?.usernameLower) {
+                createdProfile = normalizeUserDoc(uSnap.id, uSnap.data());
+                return;
+              }
+
+              const nowTs = serverTimestamp();
+              tx.set(unameRef, {
+                uid: user.uid,
+                usernameLower: candidateHandle,
+                nickname: 'Guest Demo',
+                photoURL: '',
+                status: 'Online',
+                isGuest: true,
+                expiresAt,
+                createdAt: nowTs,
+              });
+
+              const profilePayload = {
+                uid: user.uid,
+                email: '',
+                displayName: 'Guest Demo',
+                usernameLower: candidateHandle,
+                nickname: 'Guest Demo',
+                photoURL: '',
+                role: 'user',
+                isGuest: true,
+                expiresAt,
+                status: 'Online',
+                statusNote: '24h Guest Demo Session',
+                statusExpiresAt: expiresAt,
+                isBanned: false,
+                badge: 'GUEST',
+                createdAt: nowTs,
+                updatedAt: nowTs,
+              };
+              tx.set(userRef, profilePayload);
+              createdProfile = normalizeUserDoc(user.uid, profilePayload);
+            });
+            break;
+          } catch (txErr) {
+            if (txErr?.code !== 'guest-handle-collision' || attempt === 5) {
+              throw txErr;
+            }
+          }
+        }
+
+        if (createdProfile) {
+          setMyProfile(createdProfile);
+        }
+        return createdProfile;
+      } catch (err) {
+        showAppError('Guest session setup failed', err);
+        return null;
+      } finally {
+        if (guestProvisioningRef.current === user.uid) {
+          guestProvisioningRef.current = '';
+        }
+      }
+    },
+    [showAppError]
+  );
+
+  const cleanupGuestSession = useCallback(
+    async ({ expired = false } = {}) => {
+      if (guestCleaningUpRef.current) return;
+      guestCleaningUpRef.current = true;
+      setGuestEnding(true);
+
+      try {
+        if (demoMode) {
+          setDemoMode(false);
+          setMyProfile(null);
+          setAuthUser(null);
+          setActiveChat(null);
+          setProfileOpen(false);
+          setOwnerConsoleOpen(false);
+          if (expired) {
+            openModalPopup(
+              'Guest Session Expired',
+              'Your 24-hour guest demo session has expired and been cleaned up.',
+              'info'
+            );
+          } else {
+            showAppStatus('Guest session ended and cleaned up.');
+          }
+          return;
+        }
+
+        const currentUser = auth?.currentUser || authUser;
+        const guestUid = String(currentUser?.uid || myProfile?.uid || '');
+        let guestHandle = String(myProfile?.usernameLower || '');
+
+        if (db && guestUid) {
+          if (!guestHandle) {
+            try {
+              const snap = await getDoc(doc(db, 'users', guestUid));
+              if (snap.exists()) {
+                guestHandle = String(snap.data()?.usernameLower || '');
+              }
+            } catch {
+              // Best-effort lookup before cleanup
+            }
+          }
+
+          await Promise.all([
+            guestHandle
+              ? deleteDoc(doc(db, 'usernames', guestHandle)).catch(() => {})
+              : Promise.resolve(),
+            deleteDoc(doc(db, 'users', guestUid)).catch(() => {}),
+          ]);
+        }
+
+        if (auth?.currentUser) {
+          try {
+            await deleteUser(auth.currentUser);
+          } catch {
+            await signOut(auth).catch(() => {});
+          }
+        } else if (auth) {
+          await signOut(auth).catch(() => {});
+        }
+
+        setMyProfile(null);
+        setActiveChat(null);
+        setProfileOpen(false);
+        setOwnerConsoleOpen(false);
+        setNotifOpen(false);
+        setNewGroupOpen(false);
+        setGroupInfoOpen(false);
+
+        if (expired) {
+          openModalPopup(
+            'Guest Session Expired',
+            'Your 24-hour guest demo session has expired and been cleaned up.',
+            'info'
+          );
+        } else {
+          showAppStatus('Guest session ended and cleaned up.');
+        }
+      } catch (err) {
+        showAppError('Failed to end guest session', err);
+      } finally {
+        guestCleaningUpRef.current = false;
+        setGuestEnding(false);
+      }
+    },
+    [authUser, demoMode, myProfile?.uid, myProfile?.usernameLower, openModalPopup, showAppError, showAppStatus]
+  );
+
   // ---------------------------------------------------------------------------
   // 0. Global App State Listener (config/appState - single doc, Spark friendly)
   // ---------------------------------------------------------------------------
@@ -333,6 +549,7 @@ export default function App() {
             allowNewSignups: data.allowNewSignups !== false,
             allowVideoCalls: data.allowVideoCalls !== false,
             adminOnlyMessaging: Boolean(data.adminOnlyMessaging),
+            guestLoginEnabled: data.guestLoginEnabled !== false,
           });
         }
       },
@@ -353,6 +570,7 @@ export default function App() {
       setAuthReady(true);
       if (!user) {
         syncedLoginUidRef.current = '';
+        guestProvisioningRef.current = '';
         setMyProfile(null);
         setIsOwnerAdmin(false);
         setAdminVerified(false);
@@ -375,12 +593,16 @@ export default function App() {
 
       if (syncedLoginUidRef.current !== user.uid) {
         syncedLoginUidRef.current = user.uid;
-        await syncUserProfileOnLogin(user);
+        if (user.isAnonymous) {
+          await provisionGuestIdentity(user);
+        } else {
+          await syncUserProfileOnLogin(user);
+        }
       }
     });
 
     return () => unsub();
-  }, [syncUserProfileOnLogin]);
+  }, [provisionGuestIdentity, syncUserProfileOnLogin]);
 
   // Subscribe to live users/{uid} document; grant admin/owner access for role === 'owner'|'admin'|'superadmin', isAdmin, isOwner, OWNER_UID, or admins/{uid}
   useEffect(() => {
@@ -930,6 +1152,42 @@ export default function App() {
     [myProfile, contactRequests, acceptedContacts]
   );
 
+  const isGuestSession = Boolean(authUser?.isAnonymous || myProfile?.isGuest);
+  const guestExpiresAt = Number(myProfile?.expiresAt || 0);
+
+  // 24-Hour Guest Session Countdown & Automatic Expiration Cleanup
+  useEffect(() => {
+    if (!isGuestSession) return undefined;
+
+    setGuestClockNow(Date.now());
+
+    if (guestExpiresAt && Date.now() >= guestExpiresAt) {
+      cleanupGuestSession({ expired: true });
+      return undefined;
+    }
+
+    const intervalId = setInterval(() => {
+      const now = Date.now();
+      setGuestClockNow(now);
+      if (guestExpiresAt && now >= guestExpiresAt) {
+        cleanupGuestSession({ expired: true });
+      }
+    }, 15000);
+
+    let timeoutId;
+    if (guestExpiresAt) {
+      const remaining = Math.max(0, guestExpiresAt - Date.now());
+      timeoutId = setTimeout(() => {
+        cleanupGuestSession({ expired: true });
+      }, remaining);
+    }
+
+    return () => {
+      clearInterval(intervalId);
+      if (timeoutId) clearTimeout(timeoutId);
+    };
+  }, [isGuestSession, guestExpiresAt, cleanupGuestSession]);
+
   // ---------------------------------------------------------------------------
   // Handlers: Auth & Onboarding
   // ---------------------------------------------------------------------------
@@ -938,6 +1196,7 @@ export default function App() {
     setAuthLoading(true);
     setAuthError('');
     try {
+      await setPersistence(auth, browserLocalPersistence);
       const cred = await signInWithPopup(auth, googleProvider);
       if (cred?.user) {
         syncedLoginUidRef.current = cred.user.uid;
@@ -955,10 +1214,95 @@ export default function App() {
     }
   };
 
+  const handleEmailSignIn = async ({ email, password, isSignup }) => {
+    if (!isFirebaseConfigured || !auth) return;
+    setAuthLoading(true);
+    setAuthError('');
+    try {
+      if (isSignup && !appState.allowNewSignups) {
+        throw new Error('New sign-ups are currently closed by admin.');
+      }
+      await setPersistence(auth, browserLocalPersistence);
+      const cred = isSignup
+        ? await createUserWithEmailAndPassword(auth, email, password)
+        : await signInWithEmailAndPassword(auth, email, password);
+      if (cred?.user) {
+        syncedLoginUidRef.current = cred.user.uid;
+        await syncUserProfileOnLogin(cred.user);
+      }
+    } catch (err) {
+      const msg = formatFirestoreError(err, 'Email authentication failed.');
+      setAuthError(msg);
+      showAppError('Email Sign-In failed', err);
+    } finally {
+      setAuthLoading(false);
+    }
+  };
+
+  const handleGuestSignIn = async () => {
+    setAuthError('');
+    if (!appState.guestLoginEnabled) {
+      setAuthError('Guest demo mode is currently closed by admin.');
+      return;
+    }
+
+    if (!isFirebaseConfigured) {
+      const handle = generateGuestHandle();
+      const expiresAt = Date.now() + GUEST_TTL_MS;
+      const guestMe = {
+        uid: `demo_${handle}`,
+        usernameLower: handle,
+        nickname: 'Guest Demo',
+        displayName: 'Guest Demo',
+        email: '',
+        role: 'user',
+        isGuest: true,
+        expiresAt,
+        photoURL: '',
+        status: 'Online',
+        statusNote: '24h Guest Demo Session',
+        statusExpiresAt: expiresAt,
+        badge: 'GUEST',
+      };
+      setDemoMode(true);
+      setAuthUser({ uid: guestMe.uid, displayName: 'Guest Demo', isAnonymous: true });
+      setMyProfile(guestMe);
+      setIsOwnerAdmin(false);
+      setUserProfilesMap({ [guestMe.uid]: guestMe });
+      return;
+    }
+
+    if (!auth || !db) return;
+    setGuestLoading(true);
+    try {
+      const appStateSnap = await getDoc(doc(db, 'config', 'appState')).catch(() => null);
+      if (appStateSnap?.exists() && appStateSnap.data()?.guestLoginEnabled === false) {
+        throw new Error('Guest demo mode is currently closed by admin.');
+      }
+
+      // Shared-PC session isolation: wipe auth session when browser tab/window closes
+      await setPersistence(auth, browserSessionPersistence);
+      const cred = await signInAnonymously(auth);
+      if (cred?.user) {
+        syncedLoginUidRef.current = cred.user.uid;
+        await provisionGuestIdentity(cred.user);
+      }
+    } catch (err) {
+      const msg = formatFirestoreError(err, 'Guest sign-in failed.');
+      setAuthError(msg);
+      showAppError('Guest Sign-In failed', err);
+    } finally {
+      setGuestLoading(false);
+    }
+  };
+
   const handleCompleteOnboarding = async ({ usernameLower, nickname }) => {
     setAuthLoading(true);
     setOnboardError('');
     try {
+      if (authUser?.isAnonymous || myProfile?.isGuest) {
+        throw new Error('Guest accounts receive an automatic temporary handle.');
+      }
       if (!appState.allowNewSignups) {
         throw new Error('New sign-ups are currently disabled by the administrator.');
       }
@@ -1066,6 +1410,10 @@ export default function App() {
 
   const handleSignOut = async () => {
     try {
+      if (isGuestSession) {
+        await cleanupGuestSession({ expired: false });
+        return;
+      }
       if (demoMode) {
         setDemoMode(false);
         setMyProfile(null);
@@ -3140,10 +3488,26 @@ export default function App() {
       return (
         <LoginScreen
           onGoogleSignIn={handleGoogleSignIn}
+          onEmailSignIn={handleEmailSignIn}
+          onGuestSignIn={handleGuestSignIn}
+          guestLoginEnabled={appState.guestLoginEnabled}
+          allowNewSignups={appState.allowNewSignups}
           loading={authLoading}
+          guestLoading={guestLoading}
           error={authError}
           onEnterDemo={!isFirebaseConfigured ? enterDemoMode : undefined}
         />
+      );
+    }
+
+    if (authUser?.isAnonymous && (!myProfile || !myProfile.usernameLower)) {
+      return (
+        <div className="flex h-full flex-col items-center justify-center gap-4 bg-black px-6 text-center">
+          <div className="h-10 w-10 animate-spin rounded-full border-2 border-white/15 border-t-white" />
+          <span className="font-mono text-xs uppercase tracking-[0.2em] text-white/60">
+            Preparing 24h Guest Session
+          </span>
+        </div>
       );
     }
 
@@ -3727,6 +4091,28 @@ export default function App() {
           </div>
         )}
 
+        {/* Guest 24h Demo Session HUD Pill & Instant Cleanup */}
+        {isProtectedSessionReady && isGuestSession && (
+          <div className="shrink-0 flex items-center justify-between gap-2 border-b border-amber-400/25 bg-[#121212] px-3.5 py-2 text-white z-30">
+            <div className="flex items-center gap-2 min-w-0">
+              <span className="inline-flex h-2 w-2 shrink-0 rounded-full bg-amber-400" />
+              <Clock className="h-3.5 w-3.5 shrink-0 text-amber-300" />
+              <span className="truncate font-mono text-[11px] font-medium text-white/90">
+                Guest Session • Expires in {formatGuestRemaining(guestExpiresAt, guestClockNow)}
+              </span>
+            </div>
+            <button
+              type="button"
+              disabled={guestEnding}
+              onClick={() => cleanupGuestSession({ expired: false })}
+              className="inline-flex shrink-0 items-center gap-1 rounded-full border border-white/25 bg-white px-2.5 py-1 text-[10.5px] font-semibold text-black transition hover:bg-white/90 active:scale-95 disabled:opacity-50"
+            >
+              <LogOut className="h-3 w-3" />
+              <span>{guestEnding ? 'Ending...' : 'End Guest Session'}</span>
+            </button>
+          </div>
+        )}
+
         <div className="min-h-0 flex-1 overflow-hidden">
           {renderContent()}
         </div>
@@ -4048,6 +4434,37 @@ export default function App() {
                         <span
                           className={`h-5 w-5 rounded-full ${
                             appState.adminOnlyMessaging ? 'bg-black' : 'bg-white/80'
+                          }`}
+                        />
+                      </div>
+                    </button>
+
+                    <button
+                      type="button"
+                      onClick={() =>
+                        handleToggleAppFeature('guestLoginEnabled', !appState.guestLoginEnabled)
+                      }
+                      className="flex w-full items-center justify-between rounded-xl border border-white/14 bg-[#121212] px-3.5 py-2.5 text-left"
+                    >
+                      <div className="flex items-center gap-2.5 pr-3">
+                        <Clock className="h-4 w-4 text-white/80 shrink-0" />
+                        <div>
+                          <div className="text-xs font-semibold text-white">
+                            Guest Login (24h Demo)
+                          </div>
+                          <div className="text-[10.5px] text-white/45">
+                            Allow temporary anonymous guest sessions on shared computers
+                          </div>
+                        </div>
+                      </div>
+                      <div
+                        className={`flex h-6 w-11 shrink-0 items-center rounded-full p-0.5 transition ${
+                          appState.guestLoginEnabled ? 'bg-white justify-end' : 'bg-white/20 justify-start'
+                        }`}
+                      >
+                        <span
+                          className={`h-5 w-5 rounded-full ${
+                            appState.guestLoginEnabled ? 'bg-black' : 'bg-white/80'
                           }`}
                         />
                       </div>

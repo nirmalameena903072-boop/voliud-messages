@@ -36,6 +36,15 @@ service cloud.firestore {
         get(/databases/$(database)/documents/config/appState).data.get('allowNewSignups', true) != false;
     }
 
+    function guestLoginEnabled() {
+      return !exists(/databases/$(database)/documents/config/appState) ||
+        get(/databases/$(database)/documents/config/appState).data.get('guestLoginEnabled', true) != false;
+    }
+
+    function isAnonymousAuth() {
+      return isSignedIn() && request.auth.token.firebase.sign_in_provider == 'anonymous';
+    }
+
     function allowVideoCalls() {
       return !exists(/databases/$(database)/documents/config/appState) ||
         get(/databases/$(database)/documents/config/appState).data.get('allowVideoCalls', true) != false;
@@ -81,7 +90,7 @@ service cloud.firestore {
     match /usernames/{username} {
       allow read: if isSignedIn();
       allow create: if isSignedIn()
-        && allowNewSignups()
+        && (isAnonymousAuth() ? (guestLoginEnabled() && username.matches('^guest_[a-z0-9]{5}$')) : allowNewSignups())
         && username.matches('^[a-z0-9_]{3,12}$')
         && request.resource.data.uid == request.auth.uid
         && request.resource.data.usernameLower == username
@@ -90,13 +99,18 @@ service cloud.firestore {
         && resource.data.uid == request.auth.uid
         && request.resource.data.uid == request.auth.uid
         && request.resource.data.usernameLower == resource.data.usernameLower;
-      allow delete: if isAdmin();
+      allow delete: if isAdmin()
+        || (
+          isSignedIn()
+          && resource.data.uid == request.auth.uid
+          && (isAnonymousAuth() || resource.data.get('isGuest', false) == true)
+        );
     }
 
     match /users/{userId} {
       allow read: if isSignedIn();
       allow create: if isSignedIn()
-        && allowNewSignups()
+        && (isAnonymousAuth() ? guestLoginEnabled() : allowNewSignups())
         && request.auth.uid == userId
         && request.resource.data.uid == userId
         && request.resource.data.get('role', 'user') == 'user'
@@ -104,6 +118,13 @@ service cloud.firestore {
         && request.resource.data.get('isOwner', false) == false
         && request.resource.data.get('isBanned', false) == false
         && request.resource.data.get('badge', '') == ''
+        && (
+          !isAnonymousAuth()
+          || (
+            request.resource.data.get('isGuest', false) == true
+            && request.resource.data.get('usernameLower', '').matches('^guest_[a-z0-9]{5}$')
+          )
+        )
         && (
           !('usernameLower' in request.resource.data)
           || request.resource.data.usernameLower == ''
@@ -132,7 +153,12 @@ service cloud.firestore {
         isAdmin()
         && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['role', 'isAdmin', 'isOwner', 'isBanned', 'badge', 'updatedAt'])
       );
-      allow delete: if isAdmin() && userId != request.auth.uid;
+      allow delete: if (isAdmin() && userId != request.auth.uid)
+        || (
+          isSignedIn()
+          && request.auth.uid == userId
+          && (isAnonymousAuth() || resource.data.get('isGuest', false) == true)
+        );
 
       match /contacts/{contactUid} {
         allow read: if isSignedIn() && (request.auth.uid == userId || request.auth.uid == contactUid);

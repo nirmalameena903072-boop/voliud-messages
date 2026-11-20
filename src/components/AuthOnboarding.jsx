@@ -1,5 +1,16 @@
 import React, { useState } from 'react';
-import { ArrowRight, Check, KeyRound, ShieldCheck, Sparkles, Terminal } from 'lucide-react';
+import {
+  ArrowRight,
+  Check,
+  Clock,
+  KeyRound,
+  Lock,
+  Mail,
+  ShieldCheck,
+  Sparkles,
+  Terminal,
+  UserCheck,
+} from 'lucide-react';
 import { REQUIRED_FIREBASE_KEYS, isFirebaseConfigured } from '../firebase';
 import { MAX_NICKNAME_LENGTH, isValidUsername, sanitizePlainText } from '../utils/security';
 import { Tilt3DCard, VEmblem3D } from './Spatial3D';
@@ -50,44 +61,80 @@ export function FirebaseSetupBanner({ onEnterDemo }) {
   );
 }
 
-export function LoginScreen({ onGoogleSignIn, loading, error, onEnterDemo }) {
+export function LoginScreen({
+  onGoogleSignIn,
+  onEmailSignIn,
+  onGuestSignIn,
+  guestLoginEnabled = true,
+  allowNewSignups = true,
+  loading,
+  guestLoading = false,
+  error,
+  onEnterDemo,
+}) {
+  const [email, setEmail] = useState('');
+  const [password, setPassword] = useState('');
+  const [emailMode, setEmailMode] = useState('login'); // 'login' | 'signup'
+  const [showEmailForm, setShowEmailForm] = useState(false);
+  const [localError, setLocalError] = useState('');
+
+  const handleEmailSubmit = (e) => {
+    e.preventDefault();
+    const cleanEmail = email.trim().toLowerCase();
+    if (!cleanEmail || !cleanEmail.includes('@')) {
+      setLocalError('Enter a valid email address.');
+      return;
+    }
+    if (password.length < 6) {
+      setLocalError('Password must be at least 6 characters.');
+      return;
+    }
+    if (emailMode === 'signup' && !allowNewSignups) {
+      setLocalError('New sign-ups are currently closed by admin.');
+      return;
+    }
+    setLocalError('');
+    onEmailSignIn?.({ email: cleanEmail, password, isSignup: emailMode === 'signup' });
+  };
+
+  const displayError = localError || error;
+  const anyBusy = loading || guestLoading;
+
   return (
-    <div className="flex h-full w-full flex-col justify-between overflow-y-auto px-5 py-6">
+    <div className="flex h-full w-full flex-col justify-between overflow-y-auto mono-scroll px-5 py-6">
       <div className="space-y-4">
         {!isFirebaseConfigured && <FirebaseSetupBanner onEnterDemo={onEnterDemo} />}
       </div>
 
-      <div className="my-auto py-6">
-        <Tilt3DCard
-          intensity={7}
-          className="animate-card-3d-in rounded-[28px] border border-white/15 bg-[#0D0D0D] p-7 shadow-spatial-card"
-        >
+      <div className="my-auto py-4">
+        <div className="animate-card-3d-in rounded-[28px] border border-white/15 bg-[#0D0D0D] p-6 sm:p-7 shadow-spatial-card">
           <div className="flex flex-col items-center text-center">
-            <VEmblem3D size={88} />
+            <VEmblem3D size={84} />
 
-            <div className="mt-5 inline-flex items-center gap-1.5 rounded-full border border-white/15 bg-[#161616] px-3 py-1 text-[10px] font-medium uppercase tracking-[0.2em] text-white/70">
+            <div className="mt-4 inline-flex items-center gap-1.5 rounded-full border border-white/15 bg-[#161616] px-3 py-1 text-[10px] font-medium uppercase tracking-[0.2em] text-white/70">
               <Sparkles className="h-3 w-3 text-white" />
               Monochrome 3D Spatial
             </div>
 
-            <h1 className="mt-4 text-3xl font-semibold tracking-tight text-white">
+            <h1 className="mt-3.5 text-3xl font-semibold tracking-tight text-white">
               Voliud Messages
             </h1>
-            <p className="mt-2 max-w-[270px] text-xs leading-relaxed text-white/55">
+            <p className="mt-1.5 max-w-[280px] text-xs leading-relaxed text-white/55">
               Zero-noise private &amp; family messaging. Claim a 12-character handle and connect only with mutual contacts.
             </p>
 
-            {error && (
-              <div className="mt-4 w-full rounded-xl border border-white/25 bg-[#161616] px-3.5 py-2.5 text-left text-xs text-white/85">
-                {error}
+            {displayError && (
+              <div className="mt-4 w-full rounded-xl border border-red-400/35 bg-red-950/40 px-3.5 py-2.5 text-left text-xs text-red-100">
+                {displayError}
               </div>
             )}
 
+            {/* 1. Primary Google Sign-In */}
             <button
               type="button"
-              disabled={loading || !isFirebaseConfigured}
+              disabled={anyBusy || !isFirebaseConfigured}
               onClick={onGoogleSignIn}
-              className="mt-7 flex w-full items-center justify-center gap-3 rounded-2xl bg-white px-5 py-3.5 text-sm font-semibold text-black shadow-spatial-white transition duration-200 hover:bg-white/90 active:scale-[0.98] disabled:cursor-not-allowed disabled:opacity-40"
+              className="mt-6 flex w-full items-center justify-center gap-3 rounded-2xl bg-white px-5 py-3.5 text-sm font-semibold text-black shadow-spatial-white transition duration-200 hover:bg-white/90 active:scale-[0.98] disabled:cursor-not-allowed disabled:opacity-40"
             >
               <svg className="h-4 w-4 shrink-0" viewBox="0 0 24 24" aria-hidden="true">
                 <path
@@ -95,15 +142,144 @@ export function LoginScreen({ onGoogleSignIn, loading, error, onEnterDemo }) {
                   d="M21.35 11.1H12v2.98h5.35c-.46 2.4-2.55 3.97-5.35 3.97a6.05 6.05 0 1 1 0-12.1c1.55 0 2.94.58 4.01 1.54l2.24-2.24A9.18 9.18 0 0 0 12 2.8a9.2 9.2 0 1 0 0 18.4c5.31 0 8.84-3.73 8.84-8.98 0-.6-.06-1.08-.14-1.52Z"
                 />
               </svg>
-              {loading ? 'Connecting...' : 'Continue with Google'}
+              {loading && !guestLoading ? 'Connecting...' : 'Continue with Google'}
             </button>
+
+            {/* 2. Email / Password Auth */}
+            {onEmailSignIn && (
+              <div className="mt-3 w-full">
+                {!showEmailForm ? (
+                  <button
+                    type="button"
+                    disabled={anyBusy || !isFirebaseConfigured}
+                    onClick={() => setShowEmailForm(true)}
+                    className="flex w-full items-center justify-center gap-2 rounded-2xl border border-white/18 bg-[#141414] px-4 py-3 text-xs font-semibold text-white/85 hover:border-white/35 hover:text-white transition disabled:opacity-40"
+                  >
+                    <Mail className="h-3.5 w-3.5" />
+                    <span>Sign in with Email &amp; Password</span>
+                  </button>
+                ) : (
+                  <form
+                    onSubmit={handleEmailSubmit}
+                    className="mt-1 space-y-2.5 rounded-2xl border border-white/16 bg-black/80 p-3.5 text-left"
+                  >
+                    <div className="flex items-center justify-between">
+                      <div className="flex gap-1.5 rounded-xl border border-white/12 bg-[#121212] p-0.5 text-[11px]">
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setEmailMode('login');
+                            setLocalError('');
+                          }}
+                          className={`rounded-lg px-2.5 py-1 font-semibold transition ${
+                            emailMode === 'login' ? 'bg-white text-black' : 'text-white/60 hover:text-white'
+                          }`}
+                        >
+                          Sign In
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setEmailMode('signup');
+                            setLocalError('');
+                          }}
+                          className={`rounded-lg px-2.5 py-1 font-semibold transition ${
+                            emailMode === 'signup' ? 'bg-white text-black' : 'text-white/60 hover:text-white'
+                          }`}
+                        >
+                          Create Account
+                        </button>
+                      </div>
+                      <button
+                        type="button"
+                        onClick={() => setShowEmailForm(false)}
+                        className="text-[11px] text-white/45 hover:text-white"
+                      >
+                        Hide
+                      </button>
+                    </div>
+
+                    <div className="flex items-center rounded-xl border border-white/15 bg-[#121212] px-3 py-2 focus-within:border-white">
+                      <Mail className="mr-2 h-3.5 w-3.5 text-white/45 shrink-0" />
+                      <input
+                        type="email"
+                        value={email}
+                        onChange={(e) => {
+                          setEmail(e.target.value);
+                          if (localError) setLocalError('');
+                        }}
+                        placeholder="Email address"
+                        autoCapitalize="none"
+                        autoCorrect="off"
+                        className="w-full bg-transparent text-xs text-white placeholder:text-white/30 focus:outline-none"
+                      />
+                    </div>
+
+                    <div className="flex items-center rounded-xl border border-white/15 bg-[#121212] px-3 py-2 focus-within:border-white">
+                      <Lock className="mr-2 h-3.5 w-3.5 text-white/45 shrink-0" />
+                      <input
+                        type="password"
+                        value={password}
+                        onChange={(e) => {
+                          setPassword(e.target.value);
+                          if (localError) setLocalError('');
+                        }}
+                        placeholder="Password (min 6 chars)"
+                        className="w-full bg-transparent text-xs text-white placeholder:text-white/30 focus:outline-none"
+                      />
+                    </div>
+
+                    <button
+                      type="submit"
+                      disabled={anyBusy || !isFirebaseConfigured}
+                      className="flex w-full items-center justify-center gap-2 rounded-xl bg-white py-2.5 text-xs font-semibold text-black shadow-spatial-white transition active:scale-[0.98] disabled:opacity-40"
+                    >
+                      <span>
+                        {loading && !guestLoading
+                          ? 'Authenticating...'
+                          : emailMode === 'signup'
+                          ? 'Create Email Account'
+                          : 'Sign In with Email'}
+                      </span>
+                      <ArrowRight className="h-3.5 w-3.5" />
+                    </button>
+                  </form>
+                )}
+              </div>
+            )}
+
+            {/* 3. Shared-PC 24h Temporary Guest Mode */}
+            <div className="mt-4 w-full border-t border-white/12 pt-4">
+              <button
+                type="button"
+                disabled={anyBusy || !guestLoginEnabled || (!isFirebaseConfigured && !onEnterDemo)}
+                onClick={onGuestSignIn}
+                className="flex w-full items-center justify-center gap-2 rounded-2xl border border-white/25 bg-[#161616] px-4 py-3 text-xs font-semibold text-white transition hover:border-white/50 hover:bg-[#1e1e1e] active:scale-[0.98] disabled:cursor-not-allowed disabled:opacity-45"
+              >
+                <Clock className="h-3.5 w-3.5 text-white/80 shrink-0" />
+                <span>
+                  {guestLoading ? 'Starting 24h Guest Session...' : 'Continue as Guest (24h Demo)'}
+                </span>
+              </button>
+
+              {!guestLoginEnabled ? (
+                <p className="mt-2 text-[11px] font-medium text-amber-300/90">
+                  Guest demo mode is currently closed by admin.
+                </p>
+              ) : (
+                <p className="mt-2 flex items-center justify-center gap-1.5 text-[10.5px] text-white/45">
+                  <UserCheck className="h-3 w-3 shrink-0" />
+                  <span>Shared-PC safe: tab-only session &amp; auto-assigned temp @handle</span>
+                </p>
+              )}
+            </div>
 
             <div className="mt-4 flex items-center justify-center gap-2 text-[11px] text-white/40">
               <ShieldCheck className="h-3.5 w-3.5" />
               <span>Mobile redirect fallback &amp; mutual-only chats</span>
             </div>
           </div>
-        </Tilt3DCard>
+        </div>
       </div>
 
       <div className="text-center text-[10px] uppercase tracking-[0.22em] text-white/30">
